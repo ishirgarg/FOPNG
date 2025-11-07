@@ -31,14 +31,19 @@ class TaskGradientBuffer:
         return torch.stack(self.gradients, dim=1)
 
 # -----------------------------
-# Simple MLP
+# MLP Architecture (from OGD paper)
 # -----------------------------
 class MLP(nn.Module):
+    """
+    Three-layer MLP with 100 hidden units in two layers and 10 logit outputs.
+    Every layer except the final one uses ReLU activation.
+    Architecture from OGD paper (Farajtabar et al. 2019)
+    """
     def __init__(self):
         super().__init__()
-        self.fc1 = nn.Linear(28*28, 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, 10)
+        self.fc1 = nn.Linear(28*28, 100)
+        self.fc2 = nn.Linear(100, 100)
+        self.fc3 = nn.Linear(100, 10)
 
     def forward(self, x):
         x = x.view(-1, 28*28)
@@ -208,6 +213,44 @@ def train_with_fopng(model, dataloader, fopng_optimizer, criterion, F_new, F_old
               f"| ||∇θ|| mean={mean_g:.3e}±{std_g:.3e} | ||Δθ|| mean={mean_u:.3e}±{std_u:.3e} | ratio={ratio:.3e}")
 
 # -----------------------------
+# Store MODEL gradients using OGD-AVE (gradient averaging)
+# -----------------------------
+def store_model_gradients_avg(model, dataloader, task_gradients, device='mps', n_samples=200):
+    """
+    Store gradients using OGD-AVE approach: gradient w.r.t. AVERAGE of all logits.
+    
+    From OGD paper: "per sample x, we can compute the gradient with respect to the
+    average of the logits rather than use the individual logits themselves."
+    
+    This is: ∇(mean(f(x; w))) = ∇((1/c) * Σ_j f_j(x; w))
+    """
+    model.eval()
+    n_stored = 0
+    
+    for data, target in dataloader:
+        if n_stored >= n_samples:
+            break
+        data, target = data.to(device), target.to(device)
+        
+        for i in range(data.size(0)):
+            if n_stored >= n_samples:
+                break
+            
+            model.zero_grad()
+            output = model(data[i:i+1])  # [1, 10] logits
+            
+            # Compute gradient of AVERAGE of all logits
+            # This is the OGD-AVE variant
+            avg_logit = output.mean()
+            avg_logit.backward()
+            
+            flat_grad = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
+            task_gradients.add(flat_grad)
+            n_stored += 1
+    
+    print(f"  Stored {len(task_gradients.gradients)} model gradients (OGD-AVE) from {n_stored} samples")
+
+# -----------------------------
 # Evaluation
 # -----------------------------
 def evaluate(model, dataloader, device='mps'):
@@ -228,6 +271,8 @@ def run_experiment(use_fopng=True, fisher_type='diagonal', lr=1e-3, n_epochs=5):
     device = 'mps' if torch.mps.is_available() else 'cpu'
     print(f"Using device: {device}")
     print(f"Using FOPNG: {use_fopng}, Fisher type: {fisher_type}")
+    print(f"Architecture: 3-layer MLP with 100 hidden units (OGD paper)")
+    print(f"Gradient storage: OGD-AVE (average of logits)")
 
     task_pairs = [(0,1), (2,3), (4,5), (6,7), (8,9)]
     model = MLP().to(device)
@@ -265,15 +310,9 @@ def run_experiment(use_fopng=True, fisher_type='diagonal', lr=1e-3, n_epochs=5):
                 opt = Adam(model.parameters(), lr=lr)
                 train(model, train_loader, opt, criterion, n_epochs, device=device)
 
-        # Store gradient
-        model.eval(); model.zero_grad()
-        for data, target in train_loader:
-            data, target = data.to(device), target.to(device)
-            loss = criterion(model(data), target)
-            loss.backward()
-            break
-        flat_grad = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
-        task_gradients.add(flat_grad)
+        # Store MODEL gradients using OGD-AVE (average of logits)
+        print("Storing model gradients (OGD-AVE)...")
+        store_model_gradients_avg(model, train_loader, task_gradients, device=device, n_samples=200)
 
         # Evaluation
         accs = []
@@ -291,8 +330,13 @@ def run_experiment(use_fopng=True, fisher_type='diagonal', lr=1e-3, n_epochs=5):
 # Main
 # -----------------------------
 if __name__ == "__main__":
-    print("# Running FOPNG")
-    run_experiment(use_fopng=True, fisher_type='diagonal', lr=1e-3, n_epochs=15)
+    print("="*70)
+    print("FOPNG with OGD-AVE gradient storage")
+    print("Architecture: 3-layer MLP, 100 hidden units (from OGD paper)")
+    print("="*70)
+    
+    print("\n# Running FOPNG with OGD-AVE gradients")
+    run_experiment(use_fopng=True, fisher_type='diagonal', lr=1e-3, n_epochs=12)
 
     print("\n# Running Adam baseline")
-    run_experiment(use_fopng=False, fisher_type='diagonal', lr=1e-3, n_epochs=5)
+    run_experiment(use_fopng=False, fisher_type='diagonal', lr=1e-3, n_epochs=12)
