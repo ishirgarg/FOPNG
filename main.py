@@ -232,7 +232,7 @@ def run_experiment(use_fopng=True, fisher_type='diagonal', lr=1e-3, n_epochs=5):
     task_pairs = [(0,1), (2,3), (4,5), (6,7), (8,9)]
     model = MLP().to(device)
     criterion = nn.CrossEntropyLoss()
-    task_gradients = TaskGradientBuffer(scheme='low_rank', rank=200000)
+    task_gradients = TaskGradientBuffer(scheme='full', rank=200000)
     all_task_accuracies = []
 
     if use_fopng:
