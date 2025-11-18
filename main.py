@@ -1,342 +1,348 @@
+
+from collections import defaultdict
+from datetime import datetime
+from typing import List, Optional, Tuple, Dict, Any, Union
 import torch
 import torch.nn as nn
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader, Subset
-from torch.optim import Adam
+from torch.utils.data import DataLoader
 import numpy as np
 
-# -----------------------------
-# Task Gradient Storage
-# -----------------------------
-class TaskGradientBuffer:
-    def __init__(self, scheme='full', rank=None):
-        self.scheme = scheme
-        self.rank = rank
-        self.gradients = []
+from config import Config
+from models import MLP, MultiHeadMLP
+from datasets import build_permuted_mnist_tasks, build_rotated_mnist_tasks, build_split_mnist_tasks
+from optimizers import ContinualMethod, SGDMethod, OGDMethod, FOPNGMethod, AVECollector
+from gradients import GTLCollector
+from fisher import DiagonalFisherEstimator, FullFisherEstimator
+from utils import set_seed, evaluate
+from visualization import plot_results
+from logger import ExperimentLogger
 
-    def add(self, grad):
-        if self.scheme == 'low_rank':
-            if len(self.gradients) == 0:
-                self.gradients.append(grad.clone().detach())
-            else:
-                G = torch.stack(self.gradients + [grad])
-                U, S, V = torch.svd(G)
-                self.gradients = [U[:, :self.rank] @ torch.diag(S[:self.rank])]
+def run_experiment(
+    tasks: List[Tuple[DataLoader, DataLoader]],
+    model: nn.Module,
+    method: ContinualMethod,
+    config: Config,
+    multihead: bool = False,
+    optimizer_class: type = None,
+    task_names: Optional[List[str]] = None,
+    dataset_name: str = "Unknown",
+    logger: Optional[ExperimentLogger] = None
+) -> Dict[int, List[float]]:
+    """
+    Run a continual learning experiment.
+    
+    Args:
+        tasks: List of (train_loader, test_loader) tuples
+        model: Neural network model
+        method: Continual learning method
+        config: Experiment configuration
+        multihead: Whether model uses task-specific heads
+        optimizer_class: Optimizer class (default: SGD for OGD, Adam for FOPNG)
+        task_names: Optional names for each task
+        dataset_name: Name of the dataset for logging
+        logger: Optional ExperimentLogger for data collection
+    
+    Returns:
+        Dictionary mapping task_id -> list of accuracies after each training task
+    """
+    model.to(config.device)
+    
+    # Default optimizer selection
+    if optimizer_class is None:
+        if isinstance(method, FOPNGMethod):
+            optimizer_class = torch.optim.Adam
         else:
-            self.gradients.append(grad.clone().detach())
-
-    def get_matrix(self):
-        if len(self.gradients) == 0:
-            return None
-        return torch.stack(self.gradients, dim=1)
-
-# -----------------------------
-# MLP Architecture (from OGD paper)
-# -----------------------------
-class MLP(nn.Module):
-    """
-    Three-layer MLP with 100 hidden units in two layers and 10 logit outputs.
-    Every layer except the final one uses ReLU activation.
-    Architecture from OGD paper (Farajtabar et al. 2019)
-    """
-    def __init__(self):
-        super().__init__()
-        self.fc1 = nn.Linear(28*28, 100)
-        self.fc2 = nn.Linear(100, 100)
-        self.fc3 = nn.Linear(100, 10)
-
-    def forward(self, x):
-        x = x.view(-1, 28*28)
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        return self.fc3(x)
-
-# -----------------------------
-# Dataset: Split MNIST
-# -----------------------------
-def get_split_mnist(digit_pair=(0,1), train=True):
-    transform = transforms.ToTensor()
-    mnist = datasets.MNIST(root='./data', train=train, download=True, transform=transform)
-    indices = [i for i, (_, y) in enumerate(mnist) if y in digit_pair]
-    return Subset(mnist, indices)
-
-# -----------------------------
-# Empirical Fisher
-# -----------------------------
-def compute_fisher(model, dataloader, criterion, device='mps', diagonal=False):
-    if diagonal:
-        fisher = {n: torch.zeros_like(p) for n, p in model.named_parameters()}
-        model.eval()
-        for data, target in dataloader:
-            data, target = data.to(device), target.to(device)
-            model.zero_grad()
-            output = model(data)
-            loss = criterion(output, target)
-            loss.backward()
-            for n, p in model.named_parameters():
-                if p.grad is not None:
-                    fisher[n] += p.grad.data.clone() ** 2
-        for n in fisher:
-            fisher[n] /= len(dataloader)
-        return torch.cat([fisher[n].view(-1) for n in fisher])
-    else:
-        p = sum(p.numel() for p in model.parameters())
-        fisher = torch.zeros(p, p, device=device)
-        model.eval()
-        n_samples = 0
-        for data, target in dataloader:
-            data, target = data.to(device), target.to(device)
-            for i in range(data.size(0)):
-                model.zero_grad()
-                output = model(data[i:i+1])
-                loss = criterion(output, target[i:i+1])
-                loss.backward()
-                grad = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
-                fisher += torch.outer(grad, grad)
-                n_samples += 1
-        return fisher / n_samples
-
-def compute_fisher_diagonal_approx(model, dataloader, criterion, device='mps'):
-    return compute_fisher(model, dataloader, criterion, device, diagonal=True)
-
-# -----------------------------
-# FOPNG Optimizer
-# -----------------------------
-class FOPNGOptimizer:
-    def __init__(self, model, lambda_reg=1e-3, fisher_type='diagonal', epsilon=1e-10):
-        self.model = model
-        self.lambda_reg = lambda_reg
-        self.fisher_type = fisher_type
-        self.epsilon = epsilon
-
-    def step(self, gradient, F_new, F_old, G):
-        device = gradient.device
-        lam = self.lambda_reg
-
-        if self.fisher_type == 'diagonal':
-            F_new_inv_diag = 1.0 / (F_new + lam)
-            F_old_diag = F_old.view(-1, 1)
-            F_old_G = F_old_diag * G
-            weighted_G = F_old_diag * (F_new_inv_diag.view(-1,1) * F_old_G)
-            A = G.T @ weighted_G + lam * torch.eye(G.size(1), device=device)
-            A_inv = torch.inverse(A)
-
-            F_old_g = F_old * gradient
-            G_T_F_old_g = G.T @ F_old_g
-            A_inv_G_T_F_old_g = A_inv @ G_T_F_old_g
-            correction = (G @ A_inv_G_T_F_old_g).view(-1) * F_old.squeeze()
-            P_g = gradient - correction
-            F_new_inv_P_g = P_g * F_new_inv_diag
-            denom = torch.sqrt((P_g * F_new_inv_P_g).sum() + 1e-8)
-            v_star = -self.epsilon * F_new_inv_P_g / (denom + 1e-8)
-        else:
-            F_new_inv = torch.inverse(F_new + lam * torch.eye(F_new.size(0), device=device))
-            temp = F_old @ F_new_inv @ F_old @ G
-            A = G.T @ temp + lam * torch.eye(G.size(1), device=device)
-            A_inv = torch.inverse(A)
-            P = torch.eye(gradient.size(0), device=device) - F_old @ G @ A_inv @ G.T @ F_old
-            P_g = P @ gradient
-            F_new_inv_P_g = F_new_inv @ P_g
-            denom = torch.sqrt(P_g @ F_new_inv_P_g + 1e-8)
-            v_star = -self.epsilon * F_new_inv_P_g / denom
-        return v_star
-
-# -----------------------------
-# Adam Training (with stats)
-# -----------------------------
-def train(model, dataloader, optimizer, criterion, n_epochs, device='mps'):
-    model.train()
-    for epoch in range(n_epochs):
-        epoch_loss = 0.0
-        grad_norms, upd_norms = [], []
-
-        for data, target in dataloader:
-            data, target = data.to(device), target.to(device)
-            optimizer.zero_grad()
-            output = model(data)
-            loss = criterion(output, target)
-            loss.backward()
-
-            grad = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
-            grad_norms.append(grad.norm().item())
-
-            old_params = [p.clone() for p in model.parameters()]
-            optimizer.step()
-
-            with torch.no_grad():
-                upd = torch.cat([(p - o).view(-1) for p, o in zip(model.parameters(), old_params)])
-                upd_norms.append(upd.norm().item())
-
-            epoch_loss += loss.item()
-
-        mean_g, std_g = np.mean(grad_norms), np.std(grad_norms)
-        mean_u, std_u = np.mean(upd_norms), np.std(upd_norms)
-        ratio = mean_u / (mean_g + 1e-8)
-        print(f"[Adam ] Epoch {epoch+1}/{n_epochs} | Loss: {epoch_loss/len(dataloader):.4f} "
-              f"| ||∇θ|| mean={mean_g:.3e}±{std_g:.3e} | ||Δθ|| mean={mean_u:.3e}±{std_u:.3e} | ratio={ratio:.3e}")
-
-# -----------------------------
-# FOPNG Training (with stats)
-# -----------------------------
-def train_with_fopng(model, dataloader, fopng_optimizer, criterion, F_new, F_old, G, n_epochs, device='mps'):
-    model.train()
-    for epoch in range(n_epochs):
-        epoch_loss = 0.0
-        grad_norms, upd_norms = [], []
-
-        for data, target in dataloader:
-            data, target = data.to(device), target.to(device)
-            output = model(data)
-            loss = criterion(output, target)
-            model.zero_grad()
-            loss.backward()
-
-            grad = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
-            grad_norms.append(grad.norm().item())
-
-            update = fopng_optimizer.step(grad, F_new, F_old, G)
-            upd_norms.append(update.norm().item())
-
-            idx = 0
-            with torch.no_grad():
-                for p in model.parameters():
-                    n = p.numel()
-                    p.add_(update[idx:idx+n].view_as(p))
-                    idx += n
-
-            epoch_loss += loss.item()
-
-        mean_g, std_g = np.mean(grad_norms), np.std(grad_norms)
-        mean_u, std_u = np.mean(upd_norms), np.std(upd_norms)
-        ratio = mean_u / (mean_g + 1e-8)
-        print(f"[FOPNG] Epoch {epoch+1}/{n_epochs} | Loss: {epoch_loss/len(dataloader):.4f} "
-              f"| ||∇θ|| mean={mean_g:.3e}±{std_g:.3e} | ||Δθ|| mean={mean_u:.3e}±{std_u:.3e} | ratio={ratio:.3e}")
-
-# -----------------------------
-# Store MODEL gradients using OGD-AVE (gradient averaging)
-# -----------------------------
-def store_model_gradients_avg(model, dataloader, task_gradients, device='mps', n_samples=200):
-    """
-    Store gradients using OGD-AVE approach: gradient w.r.t. AVERAGE of all logits.
+            optimizer_class = torch.optim.SGD
     
-    From OGD paper: "per sample x, we can compute the gradient with respect to the
-    average of the logits rather than use the individual logits themselves."
-    
-    This is: ∇(mean(f(x; w))) = ∇((1/c) * Σ_j f_j(x; w))
-    """
-    model.eval()
-    n_stored = 0
-    
-    for data, target in dataloader:
-        if n_stored >= n_samples:
-            break
-        data, target = data.to(device), target.to(device)
-        
-        for i in range(data.size(0)):
-            if n_stored >= n_samples:
-                break
-            
-            model.zero_grad()
-            output = model(data[i:i+1])  # [1, 10] logits
-            
-            # Compute gradient of AVERAGE of all logits
-            # This is the OGD-AVE variant
-            avg_logit = output.mean()
-            avg_logit.backward()
-            
-            flat_grad = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
-            task_gradients.add(flat_grad)
-            n_stored += 1
-    
-    print(f"  Stored {len(task_gradients.gradients)} model gradients (OGD-AVE) from {n_stored} samples")
-
-# -----------------------------
-# Evaluation
-# -----------------------------
-def evaluate(model, dataloader, device='mps'):
-    model.eval()
-    correct = total = 0
-    with torch.no_grad():
-        for data, target in dataloader:
-            data, target = data.to(device), target.to(device)
-            pred = model(data).argmax(dim=1)
-            correct += (pred == target).sum().item()
-            total += target.size(0)
-    return correct / total
-
-# -----------------------------
-# Continual Learning Routine
-# -----------------------------
-def run_experiment(use_fopng=True, fisher_type='diagonal', lr=1e-3, n_epochs=5):
-    device = 'mps' if torch.mps.is_available() else 'cpu'
-    print(f"Using device: {device}")
-    print(f"Using FOPNG: {use_fopng}, Fisher type: {fisher_type}")
-    print(f"Architecture: 3-layer MLP with 100 hidden units (OGD paper)")
-    print(f"Gradient storage: OGD-AVE (average of logits)")
-
-    task_pairs = [(0,1), (2,3), (4,5), (6,7), (8,9)]
-    model = MLP().to(device)
+    optimizer = optimizer_class(model.parameters(), lr=config.lr)
     criterion = nn.CrossEntropyLoss()
-    task_gradients = TaskGradientBuffer(scheme='full', rank=200000)
-    all_task_accuracies = []
-
-    if use_fopng:
-        fopng_optimizer = FOPNGOptimizer(model, lambda_reg=1e-3, fisher_type=fisher_type, epsilon=1e-4)
-
-    for task_idx, digit_pair in enumerate(task_pairs):
-        print(f"\n=== Task {task_idx+1}: digits {digit_pair} ===")
-        train_loader = DataLoader(get_split_mnist(digit_pair, train=True), batch_size=64, shuffle=True)
-        test_loader = DataLoader(get_split_mnist(digit_pair, train=False), batch_size=64, shuffle=False)
-
-        if task_idx == 0:
-            print("Training with Adam (first task)...")
-            opt = Adam(model.parameters(), lr=lr)
-            train(model, train_loader, opt, criterion, n_epochs, device=device)
-        else:
-            F_new = compute_fisher_diagonal_approx(model, train_loader, criterion, device)
-            old_pairs = task_pairs[:task_idx]
-            old_data = []
-            for op in old_pairs:
-                old_data.extend(list(get_split_mnist(op, train=True)))
-            old_loader = DataLoader(old_data, batch_size=64, shuffle=True)
-            F_old = compute_fisher_diagonal_approx(model, old_loader, criterion, device)
-            G = task_gradients.get_matrix()
-
-            if use_fopng:
-                print("Fine-tuning with FOPNG...")
-                train_with_fopng(model, train_loader, fopng_optimizer, criterion, F_new, F_old, G, n_epochs, device=device)
-            else:
-                print("Fine-tuning with Adam...")
-                opt = Adam(model.parameters(), lr=lr)
-                train(model, train_loader, opt, criterion, n_epochs, device=device)
-
-        # Store MODEL gradients using OGD-AVE (average of logits)
-        print("Storing model gradients (OGD-AVE)...")
-        store_model_gradients_avg(model, train_loader, task_gradients, device=device, n_samples=200)
-
-        # Evaluation
-        accs = []
-        for eval_idx, pair in enumerate(task_pairs[:task_idx+1]):
-            loader = DataLoader(get_split_mnist(pair, train=False), batch_size=64, shuffle=False)
-            acc = evaluate(model, loader, device)
-            accs.append(acc)
-            print(f"  Task {eval_idx+1} ({pair}): {acc*100:.2f}%")
-        all_task_accuracies.append(accs)
-        print(f"Mean accuracy after Task {task_idx+1}: {np.mean(accs)*100:.2f}%")
-
-    return all_task_accuracies
-
-# -----------------------------
-# Main
-# -----------------------------
-if __name__ == "__main__":
-    print("="*70)
-    print("FOPNG with OGD-AVE gradient storage")
-    print("Architecture: 3-layer MLP, 100 hidden units (from OGD paper)")
-    print("="*70)
     
-    print("\n# Running FOPNG with OGD-AVE gradients")
-    run_experiment(use_fopng=True, fisher_type='diagonal', lr=1e-3, n_epochs=12)
+    method.setup(model, config)
+    results = defaultdict(list)
+    num_tasks = len(tasks)
+    
+    # Setup logger
+    if logger is None and config.log_dir:
+        logger = ExperimentLogger(config.log_dir, config.experiment_name, config)
+    
+    if logger:
+        logger.start_experiment(method.name, dataset_name, task_names)
+    
+    collect_stats = config.save_raw_data if hasattr(config, 'save_raw_data') else False
+    
+    for t in range(num_tasks):
+        task_name = task_names[t] if task_names else f"Task {t}"
+        print(f"\n{'='*60}")
+        print(f"Training on {task_name}")
+        print(f"{'='*60}")
+        
+        train_loader, _ = tasks[t]
+        
+        for epoch in range(config.epochs_per_task):
+            result = method.train_epoch(
+                model, optimizer, train_loader, criterion, config, t, multihead, collect_stats
+            )
+            loss, acc = result[0], result[1]
+            stats = result[2] if len(result) > 2 else None
+            
+            print(f"Epoch {epoch+1}/{config.epochs_per_task} | "
+                  f"Loss: {loss:.4f} | Acc: {acc*100:.2f}%", end='')
+            
+            if stats and 'grad_norm_mean' in stats:
+                print(f" | ||∇||: {stats['grad_norm_mean']:.2e}", end='')
+            print()
+            
+            if logger:
+                logger.log_epoch(
+                    task_id=t,
+                    epoch=epoch + 1,
+                    train_loss=loss,
+                    train_acc=acc,
+                    grad_norm_mean=stats.get('grad_norm_mean') if stats else None,
+                    grad_norm_std=stats.get('grad_norm_std') if stats else None,
+                    update_norm_mean=stats.get('update_norm_mean') if stats else None,
+                    update_norm_std=stats.get('update_norm_std') if stats else None,
+                    extra_stats=stats
+                )
+        
+        # Evaluation on all tasks seen so far
+        print("\nEvaluation:")
+        for eval_t in range(t + 1):
+            _, test_loader = tasks[eval_t]
+            eval_name = task_names[eval_t] if task_names else f"Task {eval_t}"
+            eval_loss, eval_acc = evaluate(
+                model, test_loader, config.device, multihead, eval_t if multihead else None
+            )
+            results[eval_t].append(eval_acc)
+            print(f"  {eval_name}: {eval_acc*100:.2f}%")
+            
+            if logger:
+                logger.log_eval(t, eval_t, eval_loss, eval_acc)
+        
+        # After-task processing (gradient collection, etc.)
+        method.after_task(model, train_loader, t, config, multihead)
+    
+    # Finalize logging
+    if logger:
+        logger.set_results(dict(results))
+        logger.end_experiment()
+        
+        if config.save_model:
+            logger.save_model_checkpoint(model, "final")
+        
+        if config.save_plots:
+            logger.create_all_plots()
+        
+        if config.save_raw_data:
+            logger.save()
+    
+    return dict(results)
 
-    print("\n# Running Adam baseline")
-    run_experiment(use_fopng=False, fisher_type='diagonal', lr=1e-3, n_epochs=12)
+def compute_metrics(results: Dict[int, List[float]]) -> Dict[str, float]:
+    """Compute continual learning metrics."""
+    num_tasks = len(results)
+    
+    # Final accuracy (average across all tasks after all training)
+    final_accs = [results[t][-1] for t in range(num_tasks)]
+    avg_final_acc = np.mean(final_accs)
+    
+    # Forgetting (average accuracy drop for each task)
+    forgetting = []
+    for t in range(num_tasks - 1):
+        max_acc = max(results[t])
+        final_acc = results[t][-1]
+        forgetting.append(max_acc - final_acc)
+    avg_forgetting = np.mean(forgetting) if forgetting else 0.0
+    
+    return {
+        'avg_final_accuracy': avg_final_acc,
+        'avg_forgetting': avg_forgetting,
+        'final_accuracies': final_accs
+    }
+
+
+def run_permuted_mnist(
+    method_name: str = 'ogd',
+    num_tasks: int = 5,
+    config: Optional[Config] = None,
+    **method_kwargs
+) -> Tuple[Dict[int, List[float]], Optional[ExperimentLogger]]:
+    """Run Permuted MNIST experiment."""
+    config = config or Config()
+    set_seed(config.seed)
+    
+    print(f"\n### Permuted MNIST ({num_tasks} tasks) — {method_name.upper()} ###")
+    
+    tasks = build_permuted_mnist_tasks(num_tasks, config.batch_size)
+    model = MLP(input_dim=784, hidden_dim=100, num_classes=10)
+    
+    method = _create_method(method_name, **method_kwargs)
+    
+    # Setup logger
+    logger = None
+    if config.log_dir:
+        exp_name = config.experiment_name or f"permuted_mnist_{method_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        logger = ExperimentLogger(config.log_dir, exp_name, config)
+    
+    results = run_experiment(
+        tasks, model, method, config,
+        multihead=False,
+        dataset_name="Permuted MNIST",
+        logger=logger
+    )
+    
+    metrics = compute_metrics(results)
+    print(f"\nFinal avg accuracy: {metrics['avg_final_accuracy']*100:.2f}%")
+    print(f"Avg forgetting: {metrics['avg_forgetting']*100:.2f}%")
+    
+    return results, logger
+
+
+def run_rotated_mnist(
+    method_name: str = 'ogd',
+    angles: Tuple[float, ...] = (0, 10, 20, 30, 40),
+    config: Optional[Config] = None,
+    **method_kwargs
+) -> Tuple[Dict[int, List[float]], Optional[ExperimentLogger]]:
+    """Run Rotated MNIST experiment."""
+    config = config or Config()
+    set_seed(config.seed)
+    
+    print(f"\n### Rotated MNIST (angles={angles}) — {method_name.upper()} ###")
+    
+    tasks = build_rotated_mnist_tasks(angles, config.batch_size)
+    model = MLP(input_dim=784, hidden_dim=100, num_classes=10)
+    
+    method = _create_method(method_name, **method_kwargs)
+    task_names = [f"Rotation {a}°" for a in angles]
+    
+    # Setup logger
+    logger = None
+    if config.log_dir:
+        exp_name = config.experiment_name or f"rotated_mnist_{method_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        logger = ExperimentLogger(config.log_dir, exp_name, config)
+    
+    results = run_experiment(
+        tasks, model, method, config,
+        multihead=False,
+        task_names=task_names,
+        dataset_name="Rotated MNIST",
+        logger=logger
+    )
+    
+    metrics = compute_metrics(results)
+    print(f"\nFinal avg accuracy: {metrics['avg_final_accuracy']*100:.2f}%")
+    print(f"Avg forgetting: {metrics['avg_forgetting']*100:.2f}%")
+    
+    return results, logger
+
+
+def run_split_mnist(
+    method_name: str = 'ogd',
+    config: Optional[Config] = None,
+    **method_kwargs
+) -> Tuple[Dict[int, List[float]], Optional[ExperimentLogger]]:
+    """Run Split MNIST experiment."""
+    config = config or Config()
+    set_seed(config.seed)
+    
+    print(f"\n### Split MNIST (5 tasks × 2 digits) — {method_name.upper()} ###")
+    
+    tasks, digits_per_task = build_split_mnist_tasks(config.batch_size)
+    model = MultiHeadMLP(
+        input_dim=784,
+        hidden_dim=100,
+        num_heads=5,
+        head_output_sizes=[2] * 5
+    )
+    
+    method = _create_method(method_name, **method_kwargs)
+    task_names = [f"Digits {d}" for d in digits_per_task]
+    
+    # Setup logger
+    logger = None
+    if config.log_dir:
+        exp_name = config.experiment_name or f"split_mnist_{method_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        logger = ExperimentLogger(config.log_dir, exp_name, config)
+    
+    results = run_experiment(
+        tasks, model, method, config,
+        multihead=True,
+        task_names=task_names,
+        dataset_name="Split MNIST",
+        logger=logger
+    )
+    
+    metrics = compute_metrics(results)
+    print(f"\nFinal avg accuracy: {metrics['avg_final_accuracy']*100:.2f}%")
+    print(f"Avg forgetting: {metrics['avg_forgetting']*100:.2f}%")
+    
+    return results, logger
+
+
+def _create_method(method_name: str, **kwargs) -> ContinualMethod:
+    """Create a continual learning method by name."""
+    method_name = method_name.lower()
+    
+    if method_name == 'sgd':
+        return SGDMethod()
+    elif method_name == 'ogd':
+        collector_type = kwargs.get('collector', 'gtl')
+        if collector_type == 'ave':
+            collector = AVECollector()
+        else:
+            collector = GTLCollector()
+        max_dirs = kwargs.get('max_directions', 2000)
+        return OGDMethod(collector=collector, max_directions=max_dirs)
+    elif method_name == 'fopng':
+        fisher_type = kwargs.get('fisher', 'diagonal')
+        if fisher_type == 'full':
+            fisher_est = FullFisherEstimator()
+        else:
+            fisher_est = DiagonalFisherEstimator()
+        collector_type = kwargs.get('collector', 'ave')
+        if collector_type == 'gtl':
+            collector = GTLCollector()
+        else:
+            collector = AVECollector()
+        max_dirs = kwargs.get('max_directions', 2000)
+        return FOPNGMethod(
+            fisher_estimator=fisher_est,
+            collector=collector,
+            max_directions=max_dirs
+        )
+    else:
+        raise ValueError(f"Unknown method: {method_name}")
+
+if __name__ == "__main__":
+    # Example usage with logging
+    config = Config(
+        seed=1234,
+        batch_size=10,
+        lr=1e-3,
+        epochs_per_task=5,
+        grads_per_task=200,
+        device="mps",
+        # Logging configuration
+        log_dir="./experiments",
+        save_model=True,
+        save_plots=True,
+        save_raw_data=True
+    )
+    
+    # Run OGD on Permuted MNIST with logging
+    # print("Running OGD with GTL collector")
+    # config.experiment_name = "ogd_gtl_permuted"
+    # ogd_results, ogd_logger = run_permuted_mnist('ogd', num_tasks=5, config=config, collector='gtl')
+    
+    # Run SGD baseline
+    # print("Running SGD baseline")
+    # config.experiment_name = "sgd_baseline_permuted"
+    # sgd_results, sgd_logger = run_permuted_mnist('sgd', num_tasks=5, config=config)
+    
+    # Run FOPNG
+    print("Running FOPNG with diagonal Fisher")
+    config.experiment_name = "fopng_diagonal_permuted"
+    config.fopng_lambda_reg = 1e-3
+    config.fopng_epsilon = 1e-4
+    fopng_results, fopng_logger = run_permuted_mnist('fopng', num_tasks=5, config=config, fisher='diagonal')
