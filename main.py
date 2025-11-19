@@ -360,7 +360,7 @@ if __name__ == "__main__":
         lr=1e-3,
         epochs_per_task=5,
         grads_per_task=200,
-        device="mps",
+        device="cuda",
         # Logging configuration
         log_dir="./experiments",
         save_model=True,
