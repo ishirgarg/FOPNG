@@ -434,9 +434,9 @@ def main():
     # Logging / saving
     # --------------------------------
     parser.add_argument("--log_dir", type=str, default="./experiments")
-    parser.add_argument("--save_model", action="store_true")
-    parser.add_argument("--save_plots", action="store_true")
-    parser.add_argument("--save_raw_data", action="store_true")
+    parser.add_argument("--save_model", action="store_true", default=True)
+    parser.add_argument("--save_plots", action="store_true", default=True)
+    parser.add_argument("--save_raw_data", action="store_true", default=True)
 
     args = parser.parse_args()
 
