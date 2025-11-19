@@ -286,8 +286,8 @@ def fisher_norm_distance(
             
             # Get gradient vector
             grad = torch.cat([
-                p.grad.view(-1) for p in model.parameters()
-                if p.grad is not None
+                p.grad.view(-1) if p.grad is not None else torch.zeros(p.numel(), device=device)
+                for p in model.parameters()
             ])
             
             # Accumulate (d^T g)^2

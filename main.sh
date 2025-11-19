@@ -6,7 +6,7 @@ CUDA_VISIBLE_DEVICES=0 python3 main.py \
     --lr 1e-3 \
     --batch_size 10 \
     --seed 42 \
-    --device cuda
+    --device cuda \
     > runs/run0.log 2>&1 &
 
 CUDA_VISIBLE_DEVICES=1 python3 main.py \
@@ -65,9 +65,9 @@ CUDA_VISIBLE_DEVICES=4 python3 main.py \
     --lr 1e-3 \
     --batch_size 10 \
     --seed 42 \
-    --device cuda \
     --fopng_lambda_reg 1e-4 \
     --fopng_epsilon 1e-4 \
+    --device cuda \
     > runs/run4.log 2>&1 &
 
 CUDA_VISIBLE_DEVICES=5 python3 main.py \
