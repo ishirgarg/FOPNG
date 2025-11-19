@@ -1,6 +1,7 @@
 
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any, Union
 import torch
 import torch.nn as nn
@@ -361,7 +362,10 @@ def make_exp_name(args):
     # Method-specific parts
     if args.method == "fopng":
         parts.append(args.fisher)
+        parts.append(args.collector)
         parts.append(f"{args.max_directions}dirs")
+        parts.append(f"lam{args.fopng_lambda_reg}")
+        parts.append(f"eps{args.fopng_epsilon}")
     elif args.method == "ogd":
         parts.append(args.collector)
         parts.append(f"{args.max_directions}dirs")
@@ -420,6 +424,12 @@ def main():
 
     parser.add_argument("--max_directions", type=int, default=2000)
 
+    # FOPNG-specific
+    parser.add_argument("--fopng_lambda_reg", type=float, default=0.0,
+                        help="Regularization parameter for FOPNG")
+    parser.add_argument("--fopng_epsilon", type=float, default=0.0,
+                        help="Epsilon parameter for FOPNG")
+
     # --------------------------------
     # Logging / saving
     # --------------------------------
@@ -451,6 +461,10 @@ def main():
         save_model=args.save_model,
         save_plots=args.save_plots,
         save_raw_data=args.save_raw_data,
+
+        # FOPNG specific
+        fopng_lambda_reg=args.fopng_lambda_reg,
+        fopng_epsilon=args.fopng_epsilon,
     )
 
     # --------------------------------------------------------------------
