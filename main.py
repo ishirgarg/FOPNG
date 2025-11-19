@@ -14,7 +14,7 @@ from models import MLP, MultiHeadMLP
 from datasets import build_permuted_mnist_tasks, build_rotated_mnist_tasks, build_split_mnist_tasks
 from optimizers import ContinualMethod, SGDMethod, OGDMethod, FOPNGMethod, AVECollector
 from gradients import GTLCollector
-from fisher import DiagonalFisherEstimator, FullFisherEstimator, fisher_norm_distance
+from fisher import DiagonalFisherEstimator, FullFisherEstimator, KFACFisherEstimator, fisher_norm_distance
 from utils import set_seed, evaluate
 from visualization import plot_results
 from logger import ExperimentLogger
@@ -336,7 +336,9 @@ def _create_method(method_name: str, **kwargs) -> ContinualMethod:
         return OGDMethod(collector=collector, max_directions=max_dirs)
     elif method_name == 'fopng':
         fisher_type = kwargs.get('fisher', 'diagonal')
-        if fisher_type == 'full':
+        if fisher_type == 'kfac':
+            fisher_est = KFACFisherEstimator()
+        elif fisher_type == 'full':
             fisher_est = FullFisherEstimator()
         else:
             fisher_est = DiagonalFisherEstimator()
@@ -420,7 +422,7 @@ def main():
                         choices=["gtl", "ave"])
 
     parser.add_argument("--fisher", type=str, default="diagonal",
-                        choices=["diagonal", "full"])
+                        choices=["diagonal", "full", "kfac"])
 
     parser.add_argument("--max_directions", type=int, default=2000)
 

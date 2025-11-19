@@ -8,7 +8,7 @@ from typing import Optional, Tuple, Dict, Any, List
 
 from config import Config
 from gradients import GradientMemory, GradientCollector, GTLCollector, AVECollector
-from fisher import FisherEstimator, DiagonalFisherEstimator, FullFisherEstimator
+from fisher import FisherEstimator, DiagonalFisherEstimator, FullFisherEstimator, KFACFisherEstimator
 from utils import get_param_count, apply_update
 from gradients import get_grad_vector, set_grad_vector
 
@@ -266,12 +266,15 @@ class FOPNGMethod(ContinualMethod):
         self.memory = GradientMemory(mode='raw', max_directions=max_directions)
         self.F_old: Optional[torch.Tensor] = None
         self.is_diagonal = isinstance(self.fisher_estimator, DiagonalFisherEstimator)
+        self.is_kfac = isinstance(self.fisher_estimator, KFACFisherEstimator)
+        self.model = None
     
     def setup(self, model: nn.Module, config: Config):
         self.memory.clear()
         self.F_old = None
         self.lambda_reg = config.fopng_lambda_reg
         self.epsilon = config.fopng_epsilon
+        self.model = model
 
     def _compute_update_prep(
         self,
@@ -296,6 +299,39 @@ class FOPNGMethod(ContinualMethod):
             raise NotImplementedError("Precomputation for full Fisher not implemented.")
 
     
+    def _split_gradient_to_layers(self, grad_vector: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Convert flat gradient vector to {layer_name: weight_matrix}."""
+        grad_dict = {}
+        idx = 0
+        for name, param in self.model.named_parameters():
+            if 'weight' in name and isinstance(self.model.get_submodule(name.replace('.weight', '')), nn.Linear):
+                n = param.numel()
+                layer_name = name.replace('.weight', '')
+                grad_dict[layer_name] = grad_vector[idx:idx+n].view_as(param)
+                idx += n
+            elif 'weight' in name:
+                # Non-linear layers, skip for now
+                n = param.numel()
+                idx += n
+        return grad_dict
+    
+    def _flatten_gradients(self, grad_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Convert {layer_name: weight_matrix} to flat vector including all parameters."""
+        # Build full gradient vector including biases and non-KFAC parameters
+        full_grad = []
+        for name, param in self.model.named_parameters():
+            if 'weight' in name:
+                layer_name = name.replace('.weight', '')
+                if layer_name in grad_dict:
+                    full_grad.append(grad_dict[layer_name].view(-1))
+                else:
+                    # For non-KFAC layers, use zeros (shouldn't happen but safe)
+                    full_grad.append(torch.zeros_like(param.view(-1)))
+            else:
+                # Biases and other parameters - set to zero (KFAC doesn't preconditon these)
+                full_grad.append(torch.zeros_like(param.view(-1)))
+        return torch.cat(full_grad)
+    
     def _compute_update(
         self,
         gradient: torch.Tensor,
@@ -307,7 +343,12 @@ class FOPNGMethod(ContinualMethod):
         """Compute FOPNG update step."""
         lam = self.lambda_reg
 
-        if self.is_diagonal:
+        if self.is_kfac:
+            # Convert vector → dict → apply KFAC → dict → vector
+            grad_dict = self._split_gradient_to_layers(gradient)
+            precond_dict = self.fisher_estimator.apply_inverse(grad_dict, lam)
+            return self._flatten_gradients(precond_dict)
+        elif self.is_diagonal:
             F_new_inv_diag = 1.0 / (F_new + lam)
             F_old_g = F_old * gradient
             G_T_F_old_g = G.T @ F_old_g
