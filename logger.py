@@ -175,13 +175,16 @@ class ExperimentLogger:
     
     def get_raw_data(self) -> Dict[str, Any]:
         """Get all raw data for export."""
-        return {
+        data = {
             'metadata': self.get_metadata(),
             'results': self.results,
             'epoch_logs': [asdict(log) for log in self.epoch_logs],
             'eval_logs': [asdict(log) for log in self.eval_logs],
             'detailed_stats': self.detailed_stats,
         }
+        if hasattr(self, 'param_distances'):
+            data['param_distances'] = self.param_distances
+        return data
     
     def save(self):
         """Save all experiment data to log directory."""
@@ -367,4 +370,30 @@ class ExperimentLogger:
         self.create_accuracy_plot(save=True)
         self.create_forgetting_plot(save=True)
         self.create_training_curves_plot(save=True)
+        self.create_distribution_drift_plot(save=True)
         plt.close('all')
+
+    def create_distribution_drift_plot(self, save: bool = True) -> plt.Figure:
+        """Plot parameter drift over tasks."""
+        if not hasattr(self, 'param_distances') or not self.param_distances:
+            return None
+        
+        fig, ax = plt.subplots(figsize=(8, 5))
+        
+        tasks = [d['task'] for d in self.param_distances]
+        l2 = [d['l2_distance'] for d in self.param_distances]
+        fisher = [d['fisher_distance'] for d in self.param_distances]
+        
+        ax.plot(tasks, l2, 'o-', label='L2 distance')
+        ax.plot(tasks, fisher, 's-', label='Fisher-weighted distance')
+        ax.set_xlabel('After training task')
+        ax.set_ylabel('Parameter drift from previous task')
+        ax.set_title(f'Distribution Change Over Time — {self.method_name}')
+        ax.legend()
+        ax.grid(True)
+        fig.tight_layout()
+        
+        if save and self.log_dir:
+            self.save_plot(fig, "distribution_drift")
+        
+        return fig

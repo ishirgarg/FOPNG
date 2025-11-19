@@ -12,7 +12,7 @@ from models import MLP, MultiHeadMLP
 from datasets import build_permuted_mnist_tasks, build_rotated_mnist_tasks, build_split_mnist_tasks
 from optimizers import ContinualMethod, SGDMethod, OGDMethod, FOPNGMethod, AVECollector
 from gradients import GTLCollector
-from fisher import DiagonalFisherEstimator, FullFisherEstimator
+from fisher import DiagonalFisherEstimator, FullFisherEstimator, fisher_norm_distance
 from utils import set_seed, evaluate
 from visualization import plot_results
 from logger import ExperimentLogger
@@ -104,10 +104,39 @@ def run_experiment(
                     update_norm_std=stats.get('update_norm_std') if stats else None,
                     extra_stats=stats
                 )
+
+        # Compute empirical Fisher
+        # Track parameter change with true Fisher
+        current_params = torch.cat([p.data.view(-1) for p in model.parameters()])
+        if t == 0:
+            prev_params = current_params.clone()
+            param_distances = []
+        else:
+            # Save current params, restore old params for Fisher computation
+            idx = 0
+            with torch.no_grad():
+                for p in model.parameters():
+                    n = p.numel()
+                    p.copy_(prev_params[idx:idx+n].view_as(p))
+                    idx += n
+            
+            fisher_dist = fisher_norm_distance(
+                model, prev_params, current_params, train_loader, criterion, config.device
+            )
+            l2_dist = torch.norm(current_params - prev_params).item()
+            
+            param_distances.append({
+                'task': t,
+                'fisher_distance': fisher_dist,
+                'l2_distance': l2_dist
+            })
+            print(f"  Parameter drift: L2={l2_dist:.4f}, Fisher-weighted={fisher_dist:.4f}")
+            
+            prev_params = current_params.clone()
         
         # Evaluation on all tasks seen so far
         print("\nEvaluation:")
-        for eval_t in range(t + 1):
+        for eval_t in range(num_tasks):
             _, test_loader = tasks[eval_t]
             eval_name = task_names[eval_t] if task_names else f"Task {eval_t}"
             eval_loss, eval_acc = evaluate(
@@ -126,6 +155,7 @@ def run_experiment(
     if logger:
         logger.set_results(dict(results))
         logger.end_experiment()
+        logger.param_distances = param_distances
         
         if config.save_model:
             logger.save_model_checkpoint(model, "final")
@@ -320,7 +350,7 @@ if __name__ == "__main__":
         seed=1234,
         batch_size=10,
         lr=1e-3,
-        epochs_per_task=8,
+        epochs_per_task=5,
         grads_per_task=200,
         device="mps",
         # Logging configuration
@@ -336,13 +366,13 @@ if __name__ == "__main__":
     # ogd_results, ogd_logger = run_permuted_mnist('ogd', num_tasks=5, config=config, collector='gtl')
     
     # Run SGD baseline
-    # print("Running SGD baseline")
-    # config.experiment_name = "sgd_baseline_permuted"
-    # sgd_results, sgd_logger = run_permuted_mnist('sgd', num_tasks=5, config=config)
+    print("Running SGD baseline")
+    config.experiment_name = "sgd_baseline_permuted"
+    sgd_results, sgd_logger = run_permuted_mnist('sgd', num_tasks=5, config=config)
     
     # Run FOPNG
-    print("Running FOPNG with diagonal Fisher")
-    config.experiment_name = "fopng_diagonal_permuted_8epoch_diffoldnew"
-    config.fopng_lambda_reg = 1e-3
-    config.fopng_epsilon = 1e-4
-    fopng_results, fopng_logger = run_permuted_mnist('fopng', num_tasks=5, config=config, fisher='diagonal')
+    # print("Running FOPNG with diagonal Fisher")
+    # config.experiment_name = "fopng_diagonal_permuted_8epoch_diffoldnew"
+    # config.fopng_lambda_reg = 1e-3
+    # config.fopng_epsilon = 1e-4
+    # fopng_results, fopng_logger = run_permuted_mnist('fopng', num_tasks=5, config=config, fisher='diagonal')

@@ -3,6 +3,7 @@ from typing import List, Optional
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+import numpy as np
 
 from utils import get_param_count
 
@@ -83,3 +84,66 @@ class FullFisherEstimator(FisherEstimator):
         
         return fisher / n_samples
 
+def fisher_norm_distance(
+    model: nn.Module,
+    old_params: torch.Tensor,
+    new_params: torch.Tensor,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    device: str
+) -> float:
+    """
+    Compute Fisher-weighted distance between parameter vectors.
+    
+    Computes sqrt(d^T F d) where d = new_params - old_params and F is the
+    empirical Fisher, without allocating the full Fisher matrix.
+    
+    Uses identity: d^T F d = (1/N) Σ (d^T g_i)^2
+    """
+    # Save current params
+    saved_params = torch.cat([p.data.view(-1).clone() for p in model.parameters()])
+    
+    # Set model to old params for Fisher computation
+    idx = 0
+    with torch.no_grad():
+        for p in model.parameters():
+            n = p.numel()
+            p.copy_(old_params[idx:idx+n].view_as(p))
+            idx += n
+    
+    diff = (new_params - old_params).to(device)
+    
+    model.eval()
+    sum_sq_dots = 0.0
+    n_samples = 0
+    
+    for data, target in dataloader:
+        data, target = data.to(device), target.to(device)
+        
+        for i in range(data.size(0)):
+            model.zero_grad()
+            output = model(data[i:i+1])
+            loss = criterion(output, target[i:i+1])
+            loss.backward()
+            
+            # Get gradient vector
+            grad = torch.cat([
+                p.grad.view(-1) for p in model.parameters()
+                if p.grad is not None
+            ])
+            
+            # Accumulate (d^T g)^2
+            dot = torch.dot(diff, grad)
+            sum_sq_dots += dot.item() ** 2
+            n_samples += 1
+    
+    # Restore original params
+    idx = 0
+    with torch.no_grad():
+        for p in model.parameters():
+            n = p.numel()
+            p.copy_(saved_params[idx:idx+n].view_as(p))
+            idx += n
+    
+    fisher_dist = np.sqrt(sum_sq_dots / n_samples) if n_samples > 0 else 0.0
+    return fisher_dist
