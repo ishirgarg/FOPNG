@@ -320,7 +320,7 @@ if __name__ == "__main__":
         seed=1234,
         batch_size=10,
         lr=1e-3,
-        epochs_per_task=5,
+        epochs_per_task=8,
         grads_per_task=200,
         device="mps",
         # Logging configuration
@@ -342,7 +342,7 @@ if __name__ == "__main__":
     
     # Run FOPNG
     print("Running FOPNG with diagonal Fisher")
-    config.experiment_name = "fopng_diagonal_permuted"
+    config.experiment_name = "fopng_diagonal_permuted_8epoch_diffoldnew"
     config.fopng_lambda_reg = 1e-3
     config.fopng_epsilon = 1e-4
     fopng_results, fopng_logger = run_permuted_mnist('fopng', num_tasks=5, config=config, fisher='diagonal')

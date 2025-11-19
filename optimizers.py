@@ -359,7 +359,7 @@ class FOPNGMethod(ContinualMethod):
             self.F_old = F_new.clone()
 
         # EXTRA CODE
-        self.F_old = F_new.clone()
+        # self.F_old = F_new.clone()
         ##
         
         model.train()
