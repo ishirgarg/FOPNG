@@ -445,7 +445,6 @@ def main():
     # ------------------------------
     exp_name = make_exp_name(args)
     out_dir = Path(args.log_dir) / exp_name
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     config = Config(
         seed=args.seed,
