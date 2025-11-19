@@ -31,6 +31,8 @@ class EvalLog:
     eval_task: int
     eval_loss: float
     eval_acc: float
+    train_loss: float
+    train_acc: float
 
 
 class ExperimentLogger:
@@ -133,14 +135,18 @@ class ExperimentLogger:
         trained_task: int,
         eval_task: int,
         eval_loss: float,
-        eval_acc: float
+        eval_acc: float,
+        train_loss: float,
+        train_acc: float
     ):
         """Log evaluation results."""
         log = EvalLog(
             trained_task=trained_task,
             eval_task=eval_task,
             eval_loss=eval_loss,
-            eval_acc=eval_acc
+            eval_acc=eval_acc,
+            train_loss=train_loss,
+            train_acc=train_acc
         )
         self.eval_logs.append(log)
     
@@ -184,6 +190,8 @@ class ExperimentLogger:
         }
         if hasattr(self, 'param_distances'):
             data['param_distances'] = self.param_distances
+        if hasattr(self, 'train_results'):
+            data['train_results'] = self.train_results
         return data
     
     def save(self):
@@ -382,10 +390,12 @@ class ExperimentLogger:
         
         tasks = [d['task'] for d in self.param_distances]
         l2 = [d['l2_distance'] for d in self.param_distances]
-        fisher = [d['fisher_distance'] for d in self.param_distances]
+        fisher_train = [d['fisher_distance_train'] for d in self.param_distances]
+        fisher_test = [d['fisher_distance_test'] for d in self.param_distances]
         
         ax.plot(tasks, l2, 'o-', label='L2 distance')
-        ax.plot(tasks, fisher, 's-', label='Fisher-weighted distance')
+        ax.plot(tasks, fisher_train, 's-', label='Fisher distance (train)')
+        ax.plot(tasks, fisher_test, '^-', label='Fisher distance (test)')
         ax.set_xlabel('After training task')
         ax.set_ylabel('Parameter drift from previous task')
         ax.set_title(f'Distribution Change Over Time — {self.method_name}')

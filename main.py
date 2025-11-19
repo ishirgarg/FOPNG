@@ -59,6 +59,7 @@ def run_experiment(
     
     method.setup(model, config)
     results = defaultdict(list)
+    train_results = defaultdict(list)
     num_tasks = len(tasks)
     
     # Setup logger
@@ -70,6 +71,8 @@ def run_experiment(
     
     collect_stats = config.save_raw_data if hasattr(config, 'save_raw_data') else False
     
+    prev_params = None
+    param_distances = []
     for t in range(num_tasks):
         task_name = task_names[t] if task_names else f"Task {t}"
         print(f"\n{'='*60}")
@@ -108,45 +111,49 @@ def run_experiment(
         # Compute empirical Fisher
         # Track parameter change with true Fisher
         current_params = torch.cat([p.data.view(-1) for p in model.parameters()])
-        if t == 0:
-            prev_params = current_params.clone()
-            param_distances = []
-        else:
-            # Save current params, restore old params for Fisher computation
-            idx = 0
-            with torch.no_grad():
-                for p in model.parameters():
-                    n = p.numel()
-                    p.copy_(prev_params[idx:idx+n].view_as(p))
-                    idx += n
+        if t > 0:
+            train_loader_t, test_loader_t = tasks[t]
             
-            fisher_dist = fisher_norm_distance(
-                model, prev_params, current_params, train_loader, criterion, config.device
+            fisher_dist_train = fisher_norm_distance(
+                model, prev_params, current_params, train_loader_t, criterion, config.device
+            )
+            fisher_dist_test = fisher_norm_distance(
+                model, prev_params, current_params, test_loader_t, criterion, config.device
             )
             l2_dist = torch.norm(current_params - prev_params).item()
             
             param_distances.append({
                 'task': t,
-                'fisher_distance': fisher_dist,
+                'fisher_distance_train': fisher_dist_train,
+                'fisher_distance_test': fisher_dist_test,
                 'l2_distance': l2_dist
             })
-            print(f"  Parameter drift: L2={l2_dist:.4f}, Fisher-weighted={fisher_dist:.4f}")
+            print(f"  Parameter drift: L2={l2_dist:.4f}, Fisher(train)={fisher_dist_train:.4f}, Fisher(test)={fisher_dist_test:.4f}")
             
-            prev_params = current_params.clone()
+        prev_params = current_params.clone()
         
         # Evaluation on all tasks seen so far
         print("\nEvaluation:")
         for eval_t in range(num_tasks):
-            _, test_loader = tasks[eval_t]
+            train_loader_eval, test_loader_eval = tasks[eval_t]
             eval_name = task_names[eval_t] if task_names else f"Task {eval_t}"
-            eval_loss, eval_acc = evaluate(
-                model, test_loader, config.device, multihead, eval_t if multihead else None
+            
+            # Test accuracy
+            test_loss, test_acc = evaluate(
+                model, test_loader_eval, config.device, multihead, eval_t if multihead else None
             )
-            results[eval_t].append(eval_acc)
-            print(f"  {eval_name}: {eval_acc*100:.2f}%")
+            train_loss, train_acc = evaluate(
+                model, train_loader_eval, config.device, multihead, eval_t if multihead else None
+            )
+            
+            results[eval_t].append(test_acc)
+            train_results[eval_t].append(train_acc)
+            
+            print(f"  {eval_name}: Train={train_acc*100:.2f}% Test={test_acc*100:.2f}%")
             
             if logger:
-                logger.log_eval(t, eval_t, eval_loss, eval_acc)
+                logger.log_eval(t, eval_t, test_loss, test_acc, train_loss, train_acc)
+                # Store train accuracy - we'll need separate storage
         
         # After-task processing (gradient collection, etc.)
         method.after_task(model, train_loader, t, config, multihead)
@@ -154,6 +161,7 @@ def run_experiment(
     # Finalize logging
     if logger:
         logger.set_results(dict(results))
+        logger.train_results = dict(train_results)  # Add this
         logger.end_experiment()
         logger.param_distances = param_distances
         
