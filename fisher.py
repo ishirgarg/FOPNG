@@ -16,7 +16,8 @@ class FisherEstimator(ABC):
         model: nn.Module,
         dataloader: DataLoader,
         criterion: nn.Module,
-        device: str
+        device: str,
+        task_id: Optional[int] = None
     ) -> torch.Tensor:
         """Estimate Fisher information."""
         pass
@@ -30,7 +31,8 @@ class DiagonalFisherEstimator(FisherEstimator):
         model: nn.Module,
         dataloader: DataLoader,
         criterion: nn.Module,
-        device: str
+        device: str,
+        task_id: Optional[int] = None
     ) -> torch.Tensor:
         fisher = {n: torch.zeros_like(p) for n, p in model.named_parameters()}
         model.eval()
@@ -38,7 +40,10 @@ class DiagonalFisherEstimator(FisherEstimator):
         for data, target in dataloader:
             data, target = data.to(device), target.to(device)
             model.zero_grad()
-            output = model(data)
+            if task_id is not None:
+                output = model(data, task_id=task_id)
+            else:
+                output = model(data)
             loss = criterion(output, target)
             loss.backward()
             
@@ -60,7 +65,8 @@ class FullFisherEstimator(FisherEstimator):
         model: nn.Module,
         dataloader: DataLoader,
         criterion: nn.Module,
-        device: str
+        device: str,
+        task_id: Optional[int] = None
     ) -> torch.Tensor:
         p = get_param_count(model)
         fisher = torch.zeros(p, p, device=device)
@@ -71,7 +77,10 @@ class FullFisherEstimator(FisherEstimator):
             data, target = data.to(device), target.to(device)
             for i in range(data.size(0)):
                 model.zero_grad()
-                output = model(data[i:i+1])
+                if task_id is not None:
+                    output = model(data[i:i+1], task_id=task_id)
+                else:
+                    output = model(data[i:i+1])
                 loss = criterion(output, target[i:i+1])
                 loss.backward()
                 
@@ -97,7 +106,8 @@ class KFACFisherEstimator(FisherEstimator):
         model: nn.Module,
         dataloader: DataLoader,
         criterion: nn.Module,
-        device: str
+        device: str,
+        task_id: Optional[int] = None
     ) -> dict:
         """Compute A and G factors for each layer."""
         activations = {}
@@ -131,7 +141,9 @@ class KFACFisherEstimator(FisherEstimator):
                 layer_names.append(name)
                 self.fisher_factors[name] = {'A': None, 'G': None}
         
-        model.eval()
+        # Use train mode to ensure hooks fire properly
+        was_training = model.training
+        model.train()
         
         # ============================================================
         # ACCUMULATE: Compute E[ā ā^T] and E[g g^T]
@@ -144,9 +156,12 @@ class KFACFisherEstimator(FisherEstimator):
             data, target = data.to(device), target.to(device)
             batch_size = data.size(0)
             
-            # Forward pass
+            # Forward pass (handle multihead models)
             model.zero_grad()
-            output = model(data)
+            if task_id is not None:
+                output = model(data, task_id=task_id)
+            else:
+                output = model(data)
             
             # Sample from model distribution (Section 5 of paper)
             with torch.no_grad():
@@ -181,9 +196,18 @@ class KFACFisherEstimator(FisherEstimator):
         for handle in handles:
             handle.remove()
         
+        # Restore original training state
+        model.train(was_training)
+        
         for name in layer_names:
-            self.fisher_factors[name]['A'] = A_sum[name] / n_samples
-            self.fisher_factors[name]['G'] = G_sum[name] / n_samples
+            if A_sum[name] is not None and G_sum[name] is not None:
+                self.fisher_factors[name]['A'] = A_sum[name] / n_samples
+                self.fisher_factors[name]['G'] = G_sum[name] / n_samples
+            else:
+                # Hooks didn't capture (e.g., unused heads in multihead models)
+                # Skip this layer - don't add to fisher_factors
+                print(f"Warning: No activations captured for layer {name}")
+                del self.fisher_factors[name]
         
         return self.fisher_factors
     
@@ -194,6 +218,14 @@ class KFACFisherEstimator(FisherEstimator):
         
         for name, factors in self.fisher_factors.items():
             A, G = factors['A'], factors['G']
+            
+            # Move to CPU for linear algebra operations if on MPS (better compatibility)
+            device = A.device
+            use_cpu = str(device).startswith('mps')
+            
+            if use_cpu:
+                A = A.cpu()
+                G = G.cpu()
             
             # Factored damping (Section 6.3)
             # π_i = √(tr(Ā)/dim(Ā) / tr(G)/dim(G))
@@ -211,6 +243,11 @@ class KFACFisherEstimator(FisherEstimator):
             except:
                 A_inv = torch.linalg.inv(A_damped)
                 G_inv = torch.linalg.inv(G_damped)
+            
+            # Move back to original device if needed
+            if use_cpu:
+                A_inv = A_inv.to(device)
+                G_inv = G_inv.to(device)
             
             inverse_factors[name] = (A_inv, G_inv)
         
@@ -241,6 +278,32 @@ class KFACFisherEstimator(FisherEstimator):
                 preconditioned[name] = grad
         
         return preconditioned
+    
+    def apply_fisher(self, gradients):
+        """
+        Apply Fisher matrix: F @ grad = (G ⊗ A) @ grad = G · grad · A^T
+        
+        Args:
+            gradients: Dict {layer_name: weight_gradient_matrix}
+        Returns:
+            Dict with Fisher applied
+        """
+        result = {}
+        
+        for name, grad in gradients.items():
+            if name in self.fisher_factors:
+                A = self.fisher_factors[name]['A']
+                G = self.fisher_factors[name]['G']
+                
+                # Handle bias: A is (in_dim+1)×(in_dim+1), grad is (out_dim)×(in_dim)
+                A_weight = A[:-1, :-1]  # Remove bias row/col
+                
+                # Apply Fisher: G · grad · A^T
+                result[name] = G @ grad @ A_weight.T
+            else:
+                result[name] = grad
+        
+        return result
 
 def fisher_norm_distance(
     model: nn.Module,
