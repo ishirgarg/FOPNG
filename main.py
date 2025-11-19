@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
+import argparse
 
 from config import Config
 from models import MLP, MultiHeadMLP
@@ -352,35 +353,138 @@ def _create_method(method_name: str, **kwargs) -> ContinualMethod:
     else:
         raise ValueError(f"Unknown method: {method_name}")
 
-if __name__ == "__main__":
-    # Example usage with logging
+def make_exp_name(args):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    parts = [args.dataset, args.method]
+
+    # Method-specific parts
+    if args.method == "fopng":
+        parts.append(args.fisher)
+        parts.append(f"{args.max_directions}dirs")
+    elif args.method == "ogd":
+        parts.append(args.collector)
+        parts.append(f"{args.max_directions}dirs")
+
+    # Dataset-specific parts
+    if args.dataset == "permuted_mnist":
+        parts.append(f"{args.num_tasks}tasks")
+    elif args.dataset == "rotated_mnist":
+        angstr = "-".join(str(a) for a in args.angles)
+        parts.append(f"angles_{angstr}")
+    elif args.dataset == "split_mnist":
+        parts.append("5tasks")
+
+    # Common parts
+    parts.append(f"{args.epochs}epochs")
+    parts.append(timestamp)
+
+    return "_".join(parts)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Continual Learning Experiments CLI")
+
+    # ------------------------------
+    # Core parameters
+    # ------------------------------
+    parser.add_argument("--dataset", type=str, required=True,
+                        choices=["permuted_mnist", "rotated_mnist", "split_mnist"])
+
+    parser.add_argument("--method", type=str, required=True,
+                        choices=["sgd", "ogd", "fopng"])
+
+    parser.add_argument("--batch_size", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--device", type=str, default="auto")
+
+    # --------------------------------
+    # Dataset-specific
+    # --------------------------------
+    parser.add_argument("--num_tasks", type=int, default=5,
+                        help="For permuted_mnist")
+
+    parser.add_argument("--angles", type=float, nargs="+", default=[0, 10, 20, 30, 40],
+                        help="For rotated_mnist")
+
+    # --------------------------------
+    # Method-specific
+    # --------------------------------
+    parser.add_argument("--collector", type=str, default="gtl",
+                        choices=["gtl", "ave"])
+
+    parser.add_argument("--fisher", type=str, default="diagonal",
+                        choices=["diagonal", "full"])
+
+    parser.add_argument("--max_directions", type=int, default=2000)
+
+    # --------------------------------
+    # Logging / saving
+    # --------------------------------
+    parser.add_argument("--log_dir", type=str, default="./experiments")
+    parser.add_argument("--save_model", action="store_true")
+    parser.add_argument("--save_plots", action="store_true")
+    parser.add_argument("--save_raw_data", action="store_true")
+
+    args = parser.parse_args()
+
+    # ------------------------------
+    # Build config
+    # ------------------------------
+    exp_name = make_exp_name(args)
+    out_dir = Path(args.log_dir) / exp_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     config = Config(
-        seed=1234,
-        batch_size=10,
-        lr=1e-3,
-        epochs_per_task=5,
+        seed=args.seed,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        epochs_per_task=args.epochs,
         grads_per_task=200,
-        device="cuda",
-        # Logging configuration
-        log_dir="./experiments",
-        save_model=True,
-        save_plots=True,
-        save_raw_data=True
+        device=args.device,
+
+        # Logging
+        log_dir=str(out_dir),
+        experiment_name=exp_name,
+        save_model=args.save_model,
+        save_plots=args.save_plots,
+        save_raw_data=args.save_raw_data,
     )
-    
-    # Run OGD on Permuted MNIST with logging
-    # print("Running OGD with GTL collector")
-    # config.experiment_name = "ogd_gtl_permuted"
-    # ogd_results, ogd_logger = run_permuted_mnist('ogd', num_tasks=5, config=config, collector='gtl')
-    
-    # Run SGD baseline
-    print("Running SGD baseline")
-    config.experiment_name = "sgd_baseline_permuted"
-    sgd_results, sgd_logger = run_permuted_mnist('sgd', num_tasks=5, config=config)
-    
-    # Run FOPNG
-    # print("Running FOPNG with diagonal Fisher")
-    # config.experiment_name = "fopng_diagonal_permuted_8epoch_diffoldnew"
-    # config.fopng_lambda_reg = 1e-3
-    # config.fopng_epsilon = 1e-4
-    # fopng_results, fopng_logger = run_permuted_mnist('fopng', num_tasks=5, config=config, fisher='diagonal')
+
+    # --------------------------------------------------------------------
+    # Run the chosen experiment
+    # --------------------------------------------------------------------
+    if args.dataset == "permuted_mnist":
+        run_permuted_mnist(
+            args.method,
+            num_tasks=args.num_tasks,
+            config=config,
+            collector=args.collector,
+            fisher=args.fisher,
+            max_directions=args.max_directions,
+        )
+
+    elif args.dataset == "rotated_mnist":
+        run_rotated_mnist(
+            args.method,
+            angles=tuple(args.angles),
+            config=config,
+            collector=args.collector,
+            fisher=args.fisher,
+            max_directions=args.max_directions,
+        )
+
+    elif args.dataset == "split_mnist":
+        run_split_mnist(
+            args.method,
+            config=config,
+            collector=args.collector,
+            fisher=args.fisher,
+            max_directions=args.max_directions,
+        )
+
+
+if __name__ == "__main__":
+    main()

@@ -291,9 +291,6 @@ class FOPNGMethod(ContinualMethod):
             weighted_G = F_old_diag * (F_new_inv_diag.view(-1, 1) * F_old_G)
             A = G.T @ weighted_G + lam * torch.eye(G.size(1), device=device)
 
-            print(f"F min/max: {F_new.min().item():.2f}/{F_new.max().item():.2f}")
-            print(f"G cond: {torch.linalg.cond(G):.2f}")
-            print(f"A cond: {torch.linalg.cond(A):.2f}")
             self.A_inv = torch.pinverse(A)
         else:
             raise NotImplementedError("Precomputation for full Fisher not implemented.")
