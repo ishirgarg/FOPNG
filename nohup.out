@@ -142,3 +142,45 @@ Traceback (most recent call last):
     dot = torch.dot(diff, grad)
           ^^^^^^^^^^^^^^^^^^^^^
 RuntimeError: inconsistent tensor size, expected tensor [89610] and src [88802] to have the same number of elements, but got 89610 and 88802 elements respectively
+
+### Split MNIST (5 tasks × 2 digits) — SGD ###
+
+============================================================
+Training on Digits [0, 1]
+============================================================
+Epoch 1/5 | Loss: 0.5002 | Acc: 93.98%
+Epoch 2/5 | Loss: 0.1296 | Acc: 99.61%
+Epoch 3/5 | Loss: 0.0411 | Acc: 99.67%
+Epoch 4/5 | Loss: 0.0237 | Acc: 99.70%
+Epoch 5/5 | Loss: 0.0172 | Acc: 99.72%
+
+Evaluation:
+  Digits [0, 1]: Train=99.75% Test=99.91%
+  Digits [2, 3]: Train=50.72% Test=49.46%
+  Digits [4, 5]: Train=51.87% Test=52.40%
+  Digits [6, 7]: Train=48.56% Test=48.24%
+  Digits [8, 9]: Train=50.42% Test=50.88%
+
+============================================================
+Training on Digits [2, 3]
+============================================================
+Epoch 1/5 | Loss: 0.6131 | Acc: 79.96%
+Epoch 2/5 | Loss: 0.3045 | Acc: 94.24%
+Epoch 3/5 | Loss: 0.1614 | Acc: 95.34%
+Epoch 4/5 | Loss: 0.1258 | Acc: 96.00%
+Epoch 5/5 | Loss: 0.1106 | Acc: 96.53%
+Traceback (most recent call last):
+  File "/home/ubuntu/fopng/FOPNG/main.py", line 504, in <module>
+    main()
+  File "/home/ubuntu/fopng/FOPNG/main.py", line 494, in main
+    run_split_mnist(
+  File "/home/ubuntu/fopng/FOPNG/main.py", line 308, in run_split_mnist
+    results = run_experiment(
+              ^^^^^^^^^^^^^^^
+  File "/home/ubuntu/fopng/FOPNG/main.py", line 119, in run_experiment
+    fisher_dist_train = fisher_norm_distance(
+                        ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/fopng/FOPNG/fisher.py", line 136, in fisher_norm_distance
+    dot = torch.dot(diff, grad)
+          ^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: inconsistent tensor size, expected tensor [89610] and src [88802] to have the same number of elements, but got 89610 and 88802 elements respectively
