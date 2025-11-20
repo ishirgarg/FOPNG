@@ -335,6 +335,59 @@ class FOPNGMethod(ContinualMethod):
         
         return v_star
     
+    def _compute_update_detailed(
+        self,
+        gradient: torch.Tensor,
+        F_new: torch.Tensor,
+        F_old: torch.Tensor,
+        G: torch.Tensor,
+        device: str
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Compute FOPNG update step with detailed debug info."""
+        lam = self.lambda_reg
+        debug_info = {}
+
+        if self.is_diagonal:
+            F_new_inv_diag = 1.0 / (F_new + lam)
+            F_old_g = F_old * gradient
+            G_T_F_old_g = G.T @ F_old_g
+            A_inv_G_T_F_old_g = self.A_inv @ G_T_F_old_g
+            correction = (G @ A_inv_G_T_F_old_g).view(-1) * F_old.squeeze()
+            P_g = gradient - correction
+            F_new_inv_P_g = P_g * F_new_inv_diag
+            denom = torch.sqrt((P_g * F_new_inv_P_g).sum() + 1e-8)
+            v_star = -self.epsilon * F_new_inv_P_g / (denom + 1e-8)
+            
+            # Debug info
+            debug_info['correction'] = correction.detach()
+            debug_info['correction_norm'] = correction.norm().item()
+            debug_info['projected_grad_norm'] = P_g.norm().item()
+            debug_info['projection_ratio'] = correction.norm().item() / (gradient.norm().item() + 1e-8)
+            debug_info['fisher_norm'] = denom.item()
+            debug_info['denom'] = denom.item()
+        else:
+            # Full Fisher
+            F_new_inv = torch.inverse(F_new + lam * torch.eye(F_new.size(0), device=device))
+            temp = F_old @ F_new_inv @ F_old @ G
+            A = G.T @ temp + lam * torch.eye(G.size(1), device=device)
+            A_inv = torch.inverse(A)
+            P = torch.eye(gradient.size(0), device=device) - F_old @ G @ A_inv @ G.T @ F_old
+            P_g = P @ gradient
+            F_new_inv_P_g = F_new_inv @ P_g
+            denom = torch.sqrt(P_g @ F_new_inv_P_g + 1e-8)
+            v_star = -self.epsilon * F_new_inv_P_g / denom
+            
+            # Debug info
+            correction = gradient - P_g
+            debug_info['correction'] = correction.detach()
+            debug_info['correction_norm'] = correction.norm().item()
+            debug_info['projected_grad_norm'] = P_g.norm().item()
+            debug_info['projection_ratio'] = correction.norm().item() / (gradient.norm().item() + 1e-8)
+            debug_info['fisher_norm'] = denom.item()
+            debug_info['denom'] = denom.item()
+        
+        return v_star, debug_info
+    
     def train_epoch(
         self,
         model: nn.Module,
@@ -370,8 +423,13 @@ class FOPNGMethod(ContinualMethod):
         
         grad_norms = []
         update_norms = []
+        projection_ratios = []
+        correction_norms = []
+        fisher_norms = []
         
         self._compute_update_prep(F_new, self.F_old, G, config.device)
+        
+        batch_idx = 0
         for x, y in train_loader:
             x = x.to(config.device)
             y = y.to(config.device)
@@ -386,12 +444,33 @@ class FOPNGMethod(ContinualMethod):
             loss.backward()
             
             grad = get_grad_vector(model)
-            if collect_stats:
-                grad_norms.append(grad.norm().item())
+            grad_norm = grad.norm().item()
             
-            update = self._compute_update(grad, F_new, self.F_old, G, config.device)
+            # Compute update with detailed tracking
+            update, debug_info = self._compute_update_detailed(grad, F_new, self.F_old, G, config.device)
+            update_norm = update.norm().item()
+            
             if collect_stats:
-                update_norms.append(update.norm().item())
+                grad_norms.append(grad_norm)
+                update_norms.append(update_norm)
+                projection_ratios.append(debug_info['projection_ratio'])
+                correction_norms.append(debug_info['correction_norm'])
+                fisher_norms.append(debug_info['fisher_norm'])
+            
+            # DEBUG: Print first batch of each epoch for task_id > 0
+            if batch_idx == 0 and task_id > 0:
+                print(f"  [FIRST BATCH DEBUG - Task {task_id}]")
+                print(f"    Gradient L2 norm: {grad_norm:.6f}")
+                print(f"    Correction L2 norm: {debug_info['correction_norm']:.6f}")
+                print(f"    Projected grad L2 norm: {debug_info['projected_grad_norm']:.6f}")
+                print(f"    Projection ratio (correction/gradient): {debug_info['projection_ratio']:.4f}")
+                print(f"    Update L2 norm: {update_norm:.6f}")
+                print(f"    Update Fisher norm: {debug_info['fisher_norm']:.6f}")
+                print(f"    Gradient direction (first 10 elements): {grad[:10].cpu().numpy()}")
+                print(f"    Correction direction (first 10 elements): {debug_info['correction'][:10].cpu().numpy()}")
+                print(f"    Update direction (first 10 elements): {update[:10].cpu().numpy()}")
+                print(f"    F_old stats: mean={self.F_old.mean().item():.6e}, norm={self.F_old.norm().item():.6f}")
+                print(f"    F_new stats: mean={F_new.mean().item():.6e}, norm={F_new.norm().item():.6f}")
             
             apply_update(model, update)
             
@@ -399,6 +478,7 @@ class FOPNGMethod(ContinualMethod):
             preds = output.argmax(dim=1)
             total_correct += (preds == y).sum().item()
             total_samples += x.size(0)
+            batch_idx += 1
         
         stats = None
         if collect_stats and grad_norms:
@@ -407,6 +487,9 @@ class FOPNGMethod(ContinualMethod):
                 'grad_norm_std': np.std(grad_norms),
                 'update_norm_mean': np.mean(update_norms),
                 'update_norm_std': np.std(update_norms),
+                'projection_ratio_mean': np.mean(projection_ratios),
+                'correction_norm_mean': np.mean(correction_norms),
+                'fisher_norm_mean': np.mean(fisher_norms),
             }
         
         return total_loss / total_samples, total_correct / total_samples, stats
@@ -499,6 +582,11 @@ class FOPNGMethod(ContinualMethod):
             norm_f_old = torch.norm(self.F_old).item()
             relative_diff = norm_diff / norm_f_old if norm_f_old > 0 else 0.0
             print(f"||F_current - F_old|| / ||F_old|| = {relative_diff:.6f}")
+            
+            # Debug: Print norms before momentum update
+            norm_f_new = torch.norm(F_current).item()
+            print(f"DEBUG: ||F_new|| = {norm_f_new:.6f}")
+            print(f"DEBUG: ||F_old|| = {norm_f_old:.6f}")
             
             if self.use_cumulative_fisher:
                 # Cumulative average: equal weight to all tasks

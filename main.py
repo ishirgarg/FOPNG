@@ -95,6 +95,8 @@ def run_experiment(
             
             if stats and 'grad_norm_mean' in stats:
                 print(f" | ||∇||: {stats['grad_norm_mean']:.2e}", end='')
+            if stats and 'projection_ratio_mean' in stats:
+                print(f" | Proj%: {stats['projection_ratio_mean']*100:.3f}%", end='')
             print()
             
             if logger:
@@ -107,6 +109,9 @@ def run_experiment(
                     grad_norm_std=stats.get('grad_norm_std') if stats else None,
                     update_norm_mean=stats.get('update_norm_mean') if stats else None,
                     update_norm_std=stats.get('update_norm_std') if stats else None,
+                    projection_ratio_mean=stats.get('projection_ratio_mean') if stats else None,
+                    correction_norm_mean=stats.get('correction_norm_mean') if stats else None,
+                    fisher_norm_mean=stats.get('fisher_norm_mean') if stats else None,
                     extra_stats=stats
                 )
 

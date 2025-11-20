@@ -22,6 +22,9 @@ class EpochLog:
     grad_norm_std: Optional[float] = None
     update_norm_mean: Optional[float] = None
     update_norm_std: Optional[float] = None
+    projection_ratio_mean: Optional[float] = None
+    correction_norm_mean: Optional[float] = None
+    fisher_norm_mean: Optional[float] = None
 
 
 @dataclass
@@ -107,6 +110,9 @@ class ExperimentLogger:
         grad_norm_std: Optional[float] = None,
         update_norm_mean: Optional[float] = None,
         update_norm_std: Optional[float] = None,
+        projection_ratio_mean: Optional[float] = None,
+        correction_norm_mean: Optional[float] = None,
+        fisher_norm_mean: Optional[float] = None,
         extra_stats: Optional[Dict[str, Any]] = None
     ):
         """Log training epoch data."""
@@ -118,7 +124,10 @@ class ExperimentLogger:
             grad_norm_mean=grad_norm_mean,
             grad_norm_std=grad_norm_std,
             update_norm_mean=update_norm_mean,
-            update_norm_std=update_norm_std
+            update_norm_std=update_norm_std,
+            projection_ratio_mean=projection_ratio_mean,
+            correction_norm_mean=correction_norm_mean,
+            fisher_norm_mean=fisher_norm_mean
         )
         self.epoch_logs.append(log)
         
