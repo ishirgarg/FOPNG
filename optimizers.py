@@ -394,7 +394,14 @@ class FOPNGMethod(ContinualMethod):
         
         # Compute Fisher matrices
         
-        F_new = self.fisher_estimator.estimate(model, train_loader, criterion, config.device)
+        F_new = self.fisher_estimator.estimate(
+            model,
+            train_loader,
+            criterion,
+            config.device,
+            multihead=multihead,
+            task_id=task_id if multihead else None
+        )
         
         if self.F_old is None:
             self.F_old = F_new.clone()
@@ -527,7 +534,14 @@ class FOPNGMethod(ContinualMethod):
     ):
         # Update F_old with current task's Fisher
         criterion = nn.CrossEntropyLoss()
-        F_current = self.fisher_estimator.estimate(model, train_loader, criterion, config.device)
+        F_current = self.fisher_estimator.estimate(
+            model,
+            train_loader,
+            criterion,
+            config.device,
+            multihead=multihead,
+            task_id=task_id if multihead else None
+        )
         
         if self.F_old is None:
             self.F_old = F_current

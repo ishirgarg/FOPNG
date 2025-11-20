@@ -16,7 +16,9 @@ class FisherEstimator(ABC):
         model: nn.Module,
         dataloader: DataLoader,
         criterion: nn.Module,
-        device: str
+        device: str,
+        multihead: bool = False,
+        task_id: Optional[int] = None
     ) -> torch.Tensor:
         """Estimate Fisher information."""
         pass
@@ -30,7 +32,9 @@ class DiagonalFisherEstimator(FisherEstimator):
         model: nn.Module,
         dataloader: DataLoader,
         criterion: nn.Module,
-        device: str
+        device: str,
+        multihead: bool = False,
+        task_id: Optional[int] = None
     ) -> torch.Tensor:
         fisher = {n: torch.zeros_like(p) for n, p in model.named_parameters()}
         model.eval()
@@ -38,7 +42,10 @@ class DiagonalFisherEstimator(FisherEstimator):
         for data, target in dataloader:
             data, target = data.to(device), target.to(device)
             model.zero_grad()
-            output = model(data)
+            if multihead:
+                output = model(data, task_id=task_id)
+            else:
+                output = model(data)
             loss = criterion(output, target)
             loss.backward()
             
@@ -60,7 +67,9 @@ class FullFisherEstimator(FisherEstimator):
         model: nn.Module,
         dataloader: DataLoader,
         criterion: nn.Module,
-        device: str
+        device: str,
+        multihead: bool = False,
+        task_id: Optional[int] = None
     ) -> torch.Tensor:
         p = get_param_count(model)
         fisher = torch.zeros(p, p, device=device)
@@ -71,7 +80,10 @@ class FullFisherEstimator(FisherEstimator):
             data, target = data.to(device), target.to(device)
             for i in range(data.size(0)):
                 model.zero_grad()
-                output = model(data[i:i+1])
+                if multihead:
+                    output = model(data[i:i+1], task_id=task_id)
+                else:
+                    output = model(data[i:i+1])
                 loss = criterion(output, target[i:i+1])
                 loss.backward()
                 
@@ -90,7 +102,9 @@ def fisher_norm_distance(
     new_params: torch.Tensor,
     dataloader: DataLoader,
     criterion: nn.Module,
-    device: str
+    device: str,
+    multihead: bool = False,
+    task_id: Optional[int] = None
 ) -> float:
     """
     Compute Fisher-weighted distance between parameter vectors.
@@ -122,6 +136,9 @@ def fisher_norm_distance(
         
         for i in range(data.size(0)):
             model.zero_grad()
+        if multihead:
+            output = model(data[i:i+1], task_id=task_id)
+        else:
             output = model(data[i:i+1])
             loss = criterion(output, target[i:i+1])
             loss.backward()

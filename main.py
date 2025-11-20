@@ -131,10 +131,24 @@ def run_experiment(
             train_loader_t, test_loader_t = tasks[t]
             
             fisher_dist_train = fisher_norm_distance(
-                model, prev_params, current_params, train_loader_t, criterion, config.device
+                model,
+                prev_params,
+                current_params,
+                train_loader_t,
+                criterion,
+                config.device,
+                multihead=multihead,
+                task_id=t if multihead else None
             )
             fisher_dist_test = fisher_norm_distance(
-                model, prev_params, current_params, test_loader_t, criterion, config.device
+                model,
+                prev_params,
+                current_params,
+                test_loader_t,
+                criterion,
+                config.device,
+                multihead=multihead,
+                task_id=t if multihead else None
             )
             l2_dist = torch.norm(current_params - prev_params).item()
             
