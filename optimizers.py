@@ -274,6 +274,9 @@ class FOPNGMethod(ContinualMethod):
         self.memory = GradientMemory(mode='raw', max_directions=max_directions)
         self.F_old: Optional[torch.Tensor] = None
         self.is_diagonal = isinstance(self.fisher_estimator, DiagonalFisherEstimator)
+        self.pinv_rcond = 1e-6
+        self.pinv_jitter = 1e-6
+        self.pinv_max_retries = 3
     
     def setup(self, model: nn.Module, config: Config):
         self.memory.clear()
@@ -299,9 +302,29 @@ class FOPNGMethod(ContinualMethod):
             weighted_G = F_old_diag * (F_new_inv_diag.view(-1, 1) * F_old_G)
             A = G.T @ weighted_G + lam * torch.eye(G.size(1), device=device)
 
-            self.A_inv = torch.pinverse(A)
+            self.A_inv = self._stable_pinv(A)
         else:
             raise NotImplementedError("Precomputation for full Fisher not implemented.")
+
+    def _stable_pinv(self, A: torch.Tensor) -> torch.Tensor:
+        """Compute pseudo-inverse with jitter/CPU fallbacks if needed."""
+        eye = torch.eye(A.size(-1), device=A.device, dtype=A.dtype)
+        jitter = self.pinv_jitter
+        for attempt in range(self.pinv_max_retries):
+            try:
+                return torch.linalg.pinv(A, rcond=self.pinv_rcond)
+            except RuntimeError:
+                if attempt == self.pinv_max_retries - 1:
+                    break
+                A = A + eye * jitter
+                jitter *= 10
+                print(f"[FOPNG] pinv failed; adding jitter {jitter:.1e} (attempt {attempt+1})")
+        # CPU double fallback
+        A_cpu = A.detach().double().cpu()
+        A_cpu += torch.eye(A_cpu.size(-1)) * jitter
+        A_inv_cpu = torch.linalg.pinv(A_cpu, rcond=self.pinv_rcond)
+        print("[FOPNG] pinv fallback computed on CPU.")
+        return A_inv_cpu.to(A.device, dtype=A.dtype)
 
     
     def _compute_update(
