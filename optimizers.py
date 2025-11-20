@@ -292,11 +292,12 @@ class FOPNGMethod(ContinualMethod):
         device: str
     ):
         """Precompute terms for FOPNG update if needed."""
-        lam = self.lambda_reg
+        lam = max(self.lambda_reg, 1e-8)
 
         if self.is_diagonal:
             # Diagonal Fisher approximation
-            F_new_inv_diag = 1.0 / (F_new + lam)
+            denom = torch.clamp(F_new + lam, min=1e-8)
+            F_new_inv_diag = 1.0 / denom
             F_old_diag = F_old.view(-1, 1)
             F_old_G = F_old_diag * G
             weighted_G = F_old_diag * (F_new_inv_diag.view(-1, 1) * F_old_G)
@@ -343,10 +344,11 @@ class FOPNGMethod(ContinualMethod):
         device: str
     ) -> torch.Tensor:
         """Compute FOPNG update step."""
-        lam = self.lambda_reg
+        lam = max(self.lambda_reg, 1e-8)
 
         if self.is_diagonal:
-            F_new_inv_diag = 1.0 / (F_new + lam)
+            denom = torch.clamp(F_new + lam, min=1e-8)
+            F_new_inv_diag = 1.0 / denom
             F_old_g = F_old * gradient
             G_T_F_old_g = G.T @ F_old_g
             A_inv_G_T_F_old_g = self.A_inv @ G_T_F_old_g
