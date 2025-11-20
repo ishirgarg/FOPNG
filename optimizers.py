@@ -259,19 +259,23 @@ class FOPNGMethod(ContinualMethod):
         self,
         fisher_estimator: FisherEstimator = None,
         collector: GradientCollector = None,
-        max_directions: int = 2000
+        max_directions: int = 2000,
+        use_cumulative_fisher: bool = False
     ):
         self.fisher_estimator = fisher_estimator or DiagonalFisherEstimator()
         self.collector = collector or AVECollector()
         self.memory = GradientMemory(mode='raw', max_directions=max_directions)
         self.F_old: Optional[torch.Tensor] = None
         self.is_diagonal = isinstance(self.fisher_estimator, DiagonalFisherEstimator)
+        self.use_cumulative_fisher = use_cumulative_fisher
+        self.num_tasks_seen = 0
     
     def setup(self, model: nn.Module, config: Config):
         self.memory.clear()
         self.F_old = None
         self.lambda_reg = config.fopng_lambda_reg
         self.epsilon = config.fopng_epsilon
+        self.num_tasks_seen = 0
 
     def _compute_update_prep(
         self,
@@ -480,11 +484,37 @@ class FOPNGMethod(ContinualMethod):
         criterion = nn.CrossEntropyLoss()
         F_current = self.fisher_estimator.estimate(model, train_loader, criterion, config.device)
         
+        print(f"\n=== Fisher Matrix Update Debug (Task {task_id}) ===")
+        print(f"F_current stats: mean={F_current.mean().item():.6f}, std={F_current.std().item():.6f}, max={F_current.max().item():.6f}")
+        
         if self.F_old is None:
             self.F_old = F_current
+            self.num_tasks_seen = 1
+            print(f"First task - initializing F_old")
         else:
-            # Combine Fisher information from old and current tasks
-            self.F_old = (self.F_old + F_current) / 2
+            print(f"F_old (before) stats: mean={self.F_old.mean().item():.6f}, std={self.F_old.std().item():.6f}, max={self.F_old.max().item():.6f}")
+            
+            # Calculate relative norm difference before update
+            norm_diff = torch.norm(F_current - self.F_old).item()
+            norm_f_old = torch.norm(self.F_old).item()
+            relative_diff = norm_diff / norm_f_old if norm_f_old > 0 else 0.0
+            print(f"||F_current - F_old|| / ||F_old|| = {relative_diff:.6f}")
+            
+            if self.use_cumulative_fisher:
+                # Cumulative average: equal weight to all tasks
+                print(f"Using CUMULATIVE averaging (equal weight to all {self.num_tasks_seen + 1} tasks)")
+                self.F_old = (self.num_tasks_seen * self.F_old + F_current) / (self.num_tasks_seen + 1)
+                self.num_tasks_seen += 1
+            else:
+                # Exponential moving average (momentum)
+                beta = config.fopng_fisher_momentum
+                print(f"Using EMA with beta (momentum) = {beta:.3f}")
+                print(f"  -> {beta:.3f} * F_old + {1-beta:.3f} * F_current")
+                self.F_old = beta * self.F_old + (1 - beta) * F_current
+            
+            print(f"F_old (after) stats: mean={self.F_old.mean().item():.6f}, std={self.F_old.std().item():.6f}, max={self.F_old.max().item():.6f}")
+        
+        print(f"===========================================\n")
         
         # Collect gradients
         print(f"Collecting FOPNG directions from task {task_id}...")

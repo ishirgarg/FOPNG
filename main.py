@@ -346,10 +346,12 @@ def _create_method(method_name: str, **kwargs) -> ContinualMethod:
         else:
             collector = AVECollector()
         max_dirs = kwargs.get('max_directions', 2000)
+        use_cumulative = kwargs.get('use_cumulative_fisher', False)
         return FOPNGMethod(
             fisher_estimator=fisher_est,
             collector=collector,
-            max_directions=max_dirs
+            max_directions=max_dirs,
+            use_cumulative_fisher=use_cumulative
         )
     else:
         raise ValueError(f"Unknown method: {method_name}")
@@ -366,6 +368,10 @@ def make_exp_name(args):
         parts.append(f"{args.max_directions}dirs")
         parts.append(f"lam{args.fopng_lambda_reg}")
         parts.append(f"eps{args.fopng_epsilon}")
+        if args.fopng_use_cumulative_fisher:
+            parts.append("cumulative")
+        else:
+            parts.append(f"momentum{args.fopng_fisher_momentum}")
     elif args.method == "ogd":
         parts.append(args.collector)
         parts.append(f"{args.max_directions}dirs")
@@ -429,6 +435,10 @@ def main():
                         help="Regularization parameter for FOPNG")
     parser.add_argument("--fopng_epsilon", type=float, default=0.0,
                         help="Epsilon parameter for FOPNG")
+    parser.add_argument("--fopng_fisher_momentum", type=float, default=0.9,
+                        help="Momentum (EMA) coefficient for Fisher matrix updates (default: 0.9)")
+    parser.add_argument("--fopng_use_cumulative_fisher", action="store_true",
+                        help="Use cumulative average (equal weight to all tasks) instead of EMA")
 
     # --------------------------------
     # Logging / saving
@@ -464,6 +474,8 @@ def main():
         # FOPNG specific
         fopng_lambda_reg=args.fopng_lambda_reg,
         fopng_epsilon=args.fopng_epsilon,
+        fopng_fisher_momentum=args.fopng_fisher_momentum,
+        fopng_use_cumulative_fisher=args.fopng_use_cumulative_fisher,
     )
 
     # --------------------------------------------------------------------
@@ -477,6 +489,7 @@ def main():
             collector=args.collector,
             fisher=args.fisher,
             max_directions=args.max_directions,
+            use_cumulative_fisher=args.fopng_use_cumulative_fisher,
         )
 
     elif args.dataset == "rotated_mnist":
@@ -487,6 +500,7 @@ def main():
             collector=args.collector,
             fisher=args.fisher,
             max_directions=args.max_directions,
+            use_cumulative_fisher=args.fopng_use_cumulative_fisher,
         )
 
     elif args.dataset == "split_mnist":
@@ -496,6 +510,7 @@ def main():
             collector=args.collector,
             fisher=args.fisher,
             max_directions=args.max_directions,
+            use_cumulative_fisher=args.fopng_use_cumulative_fisher,
         )
 
 

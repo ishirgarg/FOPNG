@@ -22,6 +22,8 @@ class Config:
     # FOPNG specific
     fopng_lambda_reg: float = 0.0
     fopng_epsilon: float = 0.0
+    fopng_fisher_momentum: float = 0.9  # EMA coefficient for Fisher matrix updates
+    fopng_use_cumulative_fisher: bool = False  # Use cumulative average instead of EMA
     
     def __post_init__(self):
         if self.device == "auto":
