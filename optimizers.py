@@ -302,6 +302,10 @@ class FOPNGMethod(ContinualMethod):
             weighted_G = F_old_diag * (F_new_inv_diag.view(-1, 1) * F_old_G)
             A = G.T @ weighted_G + lam * torch.eye(G.size(1), device=device)
 
+            if not torch.isfinite(A).all():
+                print("[FOPNG] Non-finite values in A detected; sanitizing.")
+                A = torch.nan_to_num(A, nan=0.0, posinf=1e6, neginf=-1e6)
+
             self.A_inv = self._stable_pinv(A)
         else:
             raise NotImplementedError("Precomputation for full Fisher not implemented.")
@@ -321,6 +325,9 @@ class FOPNGMethod(ContinualMethod):
                 print(f"[FOPNG] pinv failed; adding jitter {jitter:.1e} (attempt {attempt+1})")
         # CPU double fallback
         A_cpu = A.detach().double().cpu()
+        if not torch.isfinite(A_cpu).all():
+            print("[FOPNG] Non-finite values persisted in A during CPU fallback; sanitizing.")
+            A_cpu = torch.nan_to_num(A_cpu, nan=0.0, posinf=1e6, neginf=-1e6)
         A_cpu += torch.eye(A_cpu.size(-1)) * jitter
         A_inv_cpu = torch.linalg.pinv(A_cpu, rcond=self.pinv_rcond)
         print("[FOPNG] pinv fallback computed on CPU.")
