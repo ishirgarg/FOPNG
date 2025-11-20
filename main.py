@@ -10,8 +10,14 @@ import numpy as np
 import argparse
 
 from config import Config
-from models import MLP, MultiHeadMLP
-from datasets import build_permuted_mnist_tasks, build_rotated_mnist_tasks, build_split_mnist_tasks
+from models import MLP, MultiHeadMLP, SimpleCIFARCNN, MultiHeadCIFARCNN
+from datasets import (
+    build_permuted_mnist_tasks,
+    build_rotated_mnist_tasks,
+    build_split_mnist_tasks,
+    build_split_cifar10_tasks,
+    build_split_cifar100_tasks,
+)
 from optimizers import ContinualMethod, SGDMethod, OGDMethod, FOPNGMethod, AVECollector
 from gradients import GTLCollector
 from fisher import DiagonalFisherEstimator, FullFisherEstimator, fisher_norm_distance
@@ -85,7 +91,15 @@ def run_experiment(
         
         for epoch in range(config.epochs_per_task):
             result = method.train_epoch(
-                model, optimizer, train_loader, criterion, config, t, multihead, collect_stats
+                model,
+                optimizer,
+                train_loader,
+                criterion,
+                config,
+                t,
+                multihead,
+                collect_stats,
+                progress_desc=f"Task {t} Epoch {epoch+1}/{config.epochs_per_task}"
             )
             loss, acc = result[0], result[1]
             stats = result[2] if len(result) > 2 else None
@@ -320,6 +334,86 @@ def run_split_mnist(
     return results, logger
 
 
+def run_split_cifar10(
+    method_name: str = 'ogd',
+    config: Optional[Config] = None,
+    **method_kwargs
+) -> Tuple[Dict[int, List[float]], Optional[ExperimentLogger]]:
+    """Run Split CIFAR-10 (5 tasks × 2 classes) experiment."""
+    config = config or Config()
+    set_seed(config.seed)
+    
+    print(f"\n### Split CIFAR-10 (5 tasks × 2 classes) — {method_name.upper()} ###")
+    
+    tasks, class_groups = build_split_cifar10_tasks(batch_size=config.batch_size)
+    model = MultiHeadCIFARCNN(
+        num_heads=len(class_groups),
+        head_output_sizes=[len(group) for group in class_groups]
+    )
+    
+    method = _create_method(method_name, **method_kwargs)
+    task_names = [f"Classes {', '.join(map(str, group))}" for group in class_groups]
+    
+    logger = None
+    if config.log_dir:
+        exp_name = config.experiment_name or f"split_cifar10_{method_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        logger = ExperimentLogger(config.log_dir, exp_name, config)
+    
+    results = run_experiment(
+        tasks, model, method, config,
+        multihead=True,
+        task_names=task_names,
+        dataset_name="Split CIFAR-10",
+        logger=logger
+    )
+    
+    metrics = compute_metrics(results)
+    print(f"\nFinal avg accuracy: {metrics['avg_final_accuracy']*100:.2f}%")
+    print(f"Avg forgetting: {metrics['avg_forgetting']*100:.2f}%")
+    
+    return results, logger
+
+
+def run_split_cifar100(
+    method_name: str = 'ogd',
+    config: Optional[Config] = None,
+    **method_kwargs
+) -> Tuple[Dict[int, List[float]], Optional[ExperimentLogger]]:
+    """Run Split CIFAR-100 (10 tasks × 10 classes) experiment."""
+    config = config or Config()
+    set_seed(config.seed)
+    
+    print(f"\n### Split CIFAR-100 (10 tasks × 10 classes) — {method_name.upper()} ###")
+    
+    tasks, class_groups = build_split_cifar100_tasks(batch_size=config.batch_size)
+    model = MultiHeadCIFARCNN(
+        num_heads=len(class_groups),
+        head_output_sizes=[len(group) for group in class_groups]
+    )
+    
+    method = _create_method(method_name, **method_kwargs)
+    task_names = [f"Classes {', '.join(map(str, group))}" for group in class_groups]
+    
+    logger = None
+    if config.log_dir:
+        exp_name = config.experiment_name or f"split_cifar100_{method_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        logger = ExperimentLogger(config.log_dir, exp_name, config)
+    
+    results = run_experiment(
+        tasks, model, method, config,
+        multihead=True,
+        task_names=task_names,
+        dataset_name="Split CIFAR-100",
+        logger=logger
+    )
+    
+    metrics = compute_metrics(results)
+    print(f"\nFinal avg accuracy: {metrics['avg_final_accuracy']*100:.2f}%")
+    print(f"Avg forgetting: {metrics['avg_forgetting']*100:.2f}%")
+    
+    return results, logger
+
+
 def _create_method(method_name: str, **kwargs) -> ContinualMethod:
     """Create a continual learning method by name."""
     method_name = method_name.lower()
@@ -378,6 +472,10 @@ def make_exp_name(args):
         parts.append(f"angles_{angstr}")
     elif args.dataset == "split_mnist":
         parts.append("5tasks")
+    elif args.dataset == "split_cifar10":
+        parts.append("5tasks")
+    elif args.dataset == "split_cifar100":
+        parts.append("10tasks")
 
     # Common parts
     parts.append(f"{args.epochs}epochs")
@@ -393,7 +491,7 @@ def main():
     # Core parameters
     # ------------------------------
     parser.add_argument("--dataset", type=str, required=True,
-                        choices=["permuted_mnist", "rotated_mnist", "split_mnist"])
+                        choices=["permuted_mnist", "rotated_mnist", "split_mnist", "split_cifar10", "split_cifar100"])
 
     parser.add_argument("--method", type=str, required=True,
                         choices=["sgd", "ogd", "fopng"])
@@ -491,6 +589,22 @@ def main():
 
     elif args.dataset == "split_mnist":
         run_split_mnist(
+            args.method,
+            config=config,
+            collector=args.collector,
+            fisher=args.fisher,
+            max_directions=args.max_directions,
+        )
+    elif args.dataset == "split_cifar10":
+        run_split_cifar10(
+            args.method,
+            config=config,
+            collector=args.collector,
+            fisher=args.fisher,
+            max_directions=args.max_directions,
+        )
+    elif args.dataset == "split_cifar100":
+        run_split_cifar100(
             args.method,
             config=config,
             collector=args.collector,

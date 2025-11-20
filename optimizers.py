@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from typing import Optional, Tuple, Dict, Any, List
+from tqdm import tqdm
 
 from config import Config
 from gradients import GradientMemory, GradientCollector, GTLCollector, AVECollector
@@ -30,7 +31,8 @@ class ContinualMethod(ABC):
         config: Config,
         task_id: int,
         multihead: bool = False,
-        collect_stats: bool = False
+        collect_stats: bool = False,
+        progress_desc: Optional[str] = None
     ) -> Tuple[float, float, Optional[Dict[str, Any]]]:
         """
         Train for one epoch.
@@ -74,7 +76,8 @@ class SGDMethod(ContinualMethod):
         config: Config,
         task_id: int,
         multihead: bool = False,
-        collect_stats: bool = False
+        collect_stats: bool = False,
+        progress_desc: Optional[str] = None
     ) -> Tuple[float, float, Optional[Dict[str, Any]]]:
         model.train()
         total_loss = 0.0
@@ -84,7 +87,9 @@ class SGDMethod(ContinualMethod):
         grad_norms = []
         update_norms = []
         
-        for x, y in train_loader:
+        iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
+        
+        for x, y in iterator:
             x = x.to(config.device)
             y = y.to(config.device)
             
@@ -163,7 +168,8 @@ class OGDMethod(ContinualMethod):
         config: Config,
         task_id: int,
         multihead: bool = False,
-        collect_stats: bool = False
+        collect_stats: bool = False,
+        progress_desc: Optional[str] = None
     ) -> Tuple[float, float, Optional[Dict[str, Any]]]:
         model.train()
         total_loss = 0.0
@@ -174,7 +180,9 @@ class OGDMethod(ContinualMethod):
         projected_grad_norms = []
         update_norms = []
         
-        for x, y in train_loader:
+        iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
+        
+        for x, y in iterator:
             x = x.to(config.device)
             y = y.to(config.device)
             
@@ -340,13 +348,17 @@ class FOPNGMethod(ContinualMethod):
         config: Config,
         task_id: int,
         multihead: bool = False,
-        collect_stats: bool = False
+        collect_stats: bool = False,
+        progress_desc: Optional[str] = None
     ) -> Tuple[float, float, Optional[Dict[str, Any]]]:
         
         # For first task or if no stored gradients, use regular training
         G = self.memory.get_matrix()
         if task_id == 0 or G is None:
-            return self._train_regular(model, optimizer, train_loader, criterion, config, task_id, multihead, collect_stats)
+            return self._train_regular(
+                model, optimizer, train_loader, criterion, config,
+                task_id, multihead, collect_stats, progress_desc
+            )
         
         # Compute Fisher matrices
         
@@ -368,7 +380,9 @@ class FOPNGMethod(ContinualMethod):
         update_norms = []
         
         self._compute_update_prep(F_new, self.F_old, G, config.device)
-        for x, y in train_loader:
+        iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
+        
+        for x, y in iterator:
             x = x.to(config.device)
             y = y.to(config.device)
             
@@ -416,7 +430,8 @@ class FOPNGMethod(ContinualMethod):
         config: Config,
         task_id: int,
         multihead: bool = False,
-        collect_stats: bool = False
+        collect_stats: bool = False,
+        progress_desc: Optional[str] = None
     ) -> Tuple[float, float, Optional[Dict[str, Any]]]:
         """Regular Adam training for first task."""
         model.train()
@@ -427,7 +442,9 @@ class FOPNGMethod(ContinualMethod):
         grad_norms = []
         update_norms = []
         
-        for x, y in train_loader:
+        iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
+        
+        for x, y in iterator:
             x = x.to(config.device)
             y = y.to(config.device)
             
