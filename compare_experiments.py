@@ -301,52 +301,80 @@ def plot_accuracy_matrices(experiments: List[Tuple[str, Dict[int, List[float]]]]
 
 def plot_training_curves(experiments: List[Tuple[str, Dict, List[Dict]]], 
                         out: Optional[Path] = None, show: bool = False):
-    """Plot training loss and accuracy curves over epochs."""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    """Plot training loss/accuracy per task for each experiment."""
+    parsed = []
+    max_task_id = -1
     
-    for label, results, epoch_logs in experiments:
-        if not epoch_logs:
-            continue
-        
-        # Group by task
-        task_epochs = defaultdict(lambda: {'epochs': [], 'loss': [], 'acc': []})
-        for log in epoch_logs:
+    for label, _, epoch_logs in experiments:
+        task_data = defaultdict(list)
+        for log in epoch_logs or []:
             task_id = log.get('task_id', 0)
-            epoch = log.get('epoch', 0)
-            task_epochs[task_id]['epochs'].append(epoch)
-            task_epochs[task_id]['loss'].append(log.get('train_loss', 0))
-            task_epochs[task_id]['acc'].append(log.get('train_acc', 0))
+            epoch = log.get('epoch', len(task_data[task_id]) + 1)
+            task_data[task_id].append((
+                epoch,
+                log.get('train_loss', np.nan),
+                log.get('train_acc', np.nan)
+            ))
+            if task_id > max_task_id:
+                max_task_id = task_id
+        # Sort epochs for each task
+        for entries in task_data.values():
+            entries.sort(key=lambda x: x[0])
+        parsed.append((label, task_data))
+    
+    if max_task_id < 0:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.text(0.5, 0.5, 'No epoch logs available', ha='center', va='center', fontsize=12)
+        ax.axis('off')
+        _save_and_show(fig, out, show, 'training_curves')
+        return
+    
+    num_tasks = max_task_id + 1
+    fig, axes = plt.subplots(num_tasks, 2, figsize=(13, 3 * num_tasks), sharex='col')
+    if num_tasks == 1:
+        axes = np.array([axes])
+    legend_handles = {}
+    
+    for label, task_data in parsed:
+        for task_id in range(num_tasks):
+            entries = task_data.get(task_id)
+            if not entries:
+                continue
+            epochs = [e[0] for e in entries]
+            losses = [e[1] for e in entries]
+            accs = [e[2] for e in entries]
+            
+            loss_ax = axes[task_id, 0]
+            acc_ax = axes[task_id, 1]
+            
+            (loss_line,) = loss_ax.plot(epochs, losses, label=label)
+            acc_ax.plot(epochs, accs, label=label)
+            
+            if label not in legend_handles:
+                legend_handles[label] = loss_line
+    
+    for task_id in range(num_tasks):
+        loss_ax = axes[task_id, 0]
+        acc_ax = axes[task_id, 1]
         
-        # Plot aggregated curves (average across tasks)
-        all_epochs = []
-        all_losses = []
-        all_accs = []
+        loss_ax.set_ylabel(f'Task {task_id} Loss', fontsize=10)
+        loss_ax.grid(True, alpha=0.3)
         
-        for task_id in sorted(task_epochs.keys()):
-            data = task_epochs[task_id]
-            all_epochs.extend(data['epochs'])
-            all_losses.extend(data['loss'])
-            all_accs.extend(data['acc'])
-        
-        if all_epochs:
-            # Plot with running average
-            axes[0].plot(all_epochs, all_losses, alpha=0.6, label=label)
-            axes[1].plot(all_epochs, all_accs, alpha=0.6, label=label)
+        acc_ax.set_ylabel(f'Task {task_id} Accuracy', fontsize=10)
+        acc_ax.grid(True, alpha=0.3)
     
-    axes[0].set_xlabel('Epoch', fontsize=11)
-    axes[0].set_ylabel('Training Loss', fontsize=11)
-    axes[0].set_title('Training Loss', fontsize=13, fontweight='bold')
-    axes[0].legend(fontsize=10)
-    axes[0].grid(True, alpha=0.3)
+    axes[-1, 0].set_xlabel('Epoch', fontsize=11)
+    axes[-1, 1].set_xlabel('Epoch', fontsize=11)
     
-    axes[1].set_xlabel('Epoch', fontsize=11)
-    axes[1].set_ylabel('Training Accuracy', fontsize=11)
-    axes[1].set_title('Training Accuracy', fontsize=13, fontweight='bold')
-    axes[1].legend(fontsize=10)
-    axes[1].grid(True, alpha=0.3)
+    axes[0, 0].set_title('Training Loss', fontsize=12, fontweight='bold')
+    axes[0, 1].set_title('Training Accuracy', fontsize=12, fontweight='bold')
     
-    fig.tight_layout()
+    if legend_handles:
+        fig.legend(legend_handles.values(), legend_handles.keys(),
+                   loc='upper center', ncol=max(1, len(legend_handles)),
+                   bbox_to_anchor=(0.5, 1.02))
     
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
     _save_and_show(fig, out, show, 'training_curves')
 
 
@@ -617,7 +645,11 @@ Examples:
             results = extract_results(data)
         except Exception as e:
             raise SystemExit(f'Failed to parse experiment at {path}: {e}')
-        label = labels[i] if labels else path.name
+        if labels:
+            label = labels[i]
+        else:
+            meta = data.get('metadata', {})
+            label = meta.get('method_name') or meta.get('method') or path.name
         experiments_with_data.append((label, results, data))
     
     print(f"Loaded {len(experiments_with_data)} experiments")
