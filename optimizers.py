@@ -4,7 +4,7 @@ import numpy as np
 from dataclasses import dataclass
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List, Union
 from tqdm import tqdm
 
 from config import Config
@@ -179,6 +179,7 @@ class OGDMethod(ContinualMethod):
         grad_norms = []
         projected_grad_norms = []
         update_norms = []
+        projection_relative_changes = []  # ||g - g_proj|| / ||g||
         
         iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
         
@@ -199,11 +200,16 @@ class OGDMethod(ContinualMethod):
             # Project gradient if we have stored directions
             if len(self.memory) > 0:
                 g = get_grad_vector(model)
+                g_norm = g.norm().item()
                 if collect_stats:
-                    grad_norms.append(g.norm().item())
+                    grad_norms.append(g_norm)
                 g_tilde = self.memory.project_orthogonal(g)
                 if collect_stats:
                     projected_grad_norms.append(g_tilde.norm().item())
+                    # Compute relative change
+                    diff_norm = (g - g_tilde).norm().item()
+                    relative_change = diff_norm / (g_norm + 1e-10)
+                    projection_relative_changes.append(relative_change)
                 set_grad_vector(model, g_tilde)
             elif collect_stats:
                 g = get_grad_vector(model)
@@ -234,6 +240,9 @@ class OGDMethod(ContinualMethod):
             if projected_grad_norms:
                 stats['projected_grad_norm_mean'] = np.mean(projected_grad_norms)
                 stats['projected_grad_norm_std'] = np.std(projected_grad_norms)
+            if projection_relative_changes:
+                stats['ogd_projection_relative_change_mean'] = np.mean(projection_relative_changes)
+                stats['ogd_projection_relative_change_std'] = np.std(projection_relative_changes)
         
         return total_loss / total_samples, total_correct / total_samples, stats
     
@@ -310,33 +319,77 @@ class FOPNGMethod(ContinualMethod):
         F_new: torch.Tensor,
         F_old: torch.Tensor,
         G: torch.Tensor,
-        device: str
-    ) -> torch.Tensor:
-        """Compute FOPNG update step."""
+        device: str,
+        return_intermediate: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, Any]]]:
+        """
+        Compute FOPNG update step.
+        
+        If return_intermediate=True, returns (update, stats_dict) where stats_dict contains:
+        - raw_grad_norm: ||g||
+        - fisher_grad_norm: ||F_old^{1/2} * g||
+        - fisher_proj_grad_norm: ||projected gradient in Fisher space||
+        - eucl_proj_grad_norm: ||F_old^{-1/2} * projected gradient||
+        - projected_grad: the projected gradient P_g (for computing relative change)
+        """
         lam = self.lambda_reg
+        
+        intermediate_stats = {}
+        if return_intermediate:
+            intermediate_stats['raw_grad_norm'] = gradient.norm().item()
 
         if self.is_diagonal:
+            # Transform to Fisher space: g_F = F_old^{1/2} * g
+            F_old_sqrt = torch.sqrt(F_old + 1e-10)
+            g_fisher = F_old_sqrt * gradient
+            if return_intermediate:
+                intermediate_stats['fisher_grad_norm'] = g_fisher.norm().item()
+            
             F_new_inv_diag = 1.0 / (F_new + lam)
             F_old_g = F_old * gradient
             G_T_F_old_g = G.T @ F_old_g
             A_inv_G_T_F_old_g = self.A_inv @ G_T_F_old_g
             correction = (G @ A_inv_G_T_F_old_g).view(-1) * F_old.squeeze()
             P_g = gradient - correction
+            
+            # P_g is the projected gradient in Euclidean space
+            # To get Fisher space projected gradient: F_old^{1/2} * P_g
+            if return_intermediate:
+                g_fisher_proj = F_old_sqrt * P_g
+                intermediate_stats['fisher_proj_grad_norm'] = g_fisher_proj.norm().item()
+                intermediate_stats['eucl_proj_grad_norm'] = P_g.norm().item()
+                intermediate_stats['projected_grad'] = P_g
+            
             F_new_inv_P_g = P_g * F_new_inv_diag
             denom = torch.sqrt((P_g * F_new_inv_P_g).sum() + 1e-8)
             v_star = -self.epsilon * F_new_inv_P_g / (denom + 1e-8)
         else:
             # Full Fisher
+            # Transform to Fisher space
+            F_old_sqrt = torch.linalg.cholesky(F_old + lam * torch.eye(F_old.size(0), device=device))
+            g_fisher = F_old_sqrt @ gradient
+            if return_intermediate:
+                intermediate_stats['fisher_grad_norm'] = g_fisher.norm().item()
+            
             F_new_inv = torch.inverse(F_new + lam * torch.eye(F_new.size(0), device=device))
             temp = F_old @ F_new_inv @ F_old @ G
             A = G.T @ temp + lam * torch.eye(G.size(1), device=device)
             A_inv = torch.inverse(A)
             P = torch.eye(gradient.size(0), device=device) - F_old @ G @ A_inv @ G.T @ F_old
             P_g = P @ gradient
+            
+            if return_intermediate:
+                g_fisher_proj = F_old_sqrt @ P_g
+                intermediate_stats['fisher_proj_grad_norm'] = g_fisher_proj.norm().item()
+                intermediate_stats['eucl_proj_grad_norm'] = P_g.norm().item()
+                intermediate_stats['projected_grad'] = P_g
+            
             F_new_inv_P_g = F_new_inv @ P_g
             denom = torch.sqrt(P_g @ F_new_inv_P_g + 1e-8)
             v_star = -self.epsilon * F_new_inv_P_g / denom
         
+        if return_intermediate:
+            return v_star, intermediate_stats
         return v_star
     
     def train_epoch(
@@ -378,6 +431,10 @@ class FOPNGMethod(ContinualMethod):
         
         grad_norms = []
         update_norms = []
+        fisher_grad_norms = []
+        fisher_proj_grad_norms = []
+        eucl_proj_grad_norms = []
+        fopng_relative_changes = []  # ||g - P_g|| / ||g||
         
         self._compute_update_prep(F_new, self.F_old, G, config.device)
         iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
@@ -396,12 +453,25 @@ class FOPNGMethod(ContinualMethod):
             loss.backward()
             
             grad = get_grad_vector(model)
-            if collect_stats:
-                grad_norms.append(grad.norm().item())
             
-            update = self._compute_update(grad, F_new, self.F_old, G, config.device)
             if collect_stats:
+                update, inter_stats = self._compute_update(
+                    grad, F_new, self.F_old, G, config.device, return_intermediate=True
+                )
+                grad_norms.append(inter_stats['raw_grad_norm'])
+                fisher_grad_norms.append(inter_stats['fisher_grad_norm'])
+                fisher_proj_grad_norms.append(inter_stats['fisher_proj_grad_norm'])
+                eucl_proj_grad_norms.append(inter_stats['eucl_proj_grad_norm'])
                 update_norms.append(update.norm().item())
+                
+                # Compute relative change: ||g - P_g|| / ||g||
+                P_g = inter_stats['projected_grad']
+                diff_norm = (grad - P_g).norm().item()
+                raw_norm = inter_stats['raw_grad_norm']
+                rel_change = diff_norm / (raw_norm + 1e-10)
+                fopng_relative_changes.append(rel_change)
+            else:
+                update = self._compute_update(grad, F_new, self.F_old, G, config.device)
             
             apply_update(model, update)
             
@@ -417,7 +487,17 @@ class FOPNGMethod(ContinualMethod):
                 'grad_norm_std': np.std(grad_norms),
                 'update_norm_mean': np.mean(update_norms),
                 'update_norm_std': np.std(update_norms),
+                'fopng_fisher_grad_norm_mean': np.mean(fisher_grad_norms),
+                'fopng_fisher_grad_norm_std': np.std(fisher_grad_norms),
+                'fopng_fisher_proj_grad_norm_mean': np.mean(fisher_proj_grad_norms),
+                'fopng_fisher_proj_grad_norm_std': np.std(fisher_proj_grad_norms),
+                'fopng_eucl_proj_grad_norm_mean': np.mean(eucl_proj_grad_norms),
+                'fopng_eucl_proj_grad_norm_std': np.std(eucl_proj_grad_norms),
             }
+            
+            if fopng_relative_changes:
+                stats['fopng_projection_relative_change_mean'] = np.mean(fopng_relative_changes)
+                stats['fopng_projection_relative_change_std'] = np.std(fopng_relative_changes)
         
         return total_loss / total_samples, total_correct / total_samples, stats
     

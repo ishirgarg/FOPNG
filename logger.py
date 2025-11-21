@@ -379,7 +379,126 @@ class ExperimentLogger:
         self.create_forgetting_plot(save=True)
         self.create_training_curves_plot(save=True)
         self.create_distribution_drift_plot(save=True)
+        self.create_projection_analysis_plots(save=True)
         plt.close('all')
+
+    def create_projection_analysis_plots(self, save: bool = True):
+        """Create plots analyzing gradient projection effects."""
+        if not self.detailed_stats:
+            return
+        
+        # Check if we have FOPNG stats
+        has_fopng_stats = any('fopng_fisher_grad_norm_mean' in s for s in self.detailed_stats)
+        has_ogd_stats = any('ogd_projection_relative_change_mean' in s for s in self.detailed_stats)
+        
+        if has_fopng_stats:
+            self._create_fopng_norms_plot(save)
+            self._create_fopng_relative_change_plot(save)
+        
+        if has_ogd_stats:
+            self._create_ogd_relative_change_plot(save)
+    
+    def _create_fopng_norms_plot(self, save: bool = True):
+        """Plot FOPNG gradient norms at different stages of transformation."""
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        epochs = []
+        raw_norms = []
+        fisher_norms = []
+        fisher_proj_norms = []
+        eucl_proj_norms = []
+        
+        for stat in self.detailed_stats:
+            if 'fopng_fisher_grad_norm_mean' in stat:
+                epoch_id = stat['task_id'] * 10 + stat['epoch']  # Simple epoch counter
+                epochs.append(epoch_id)
+                raw_norms.append(stat.get('grad_norm_mean', 0))
+                fisher_norms.append(stat.get('fopng_fisher_grad_norm_mean', 0))
+                fisher_proj_norms.append(stat.get('fopng_fisher_proj_grad_norm_mean', 0))
+                eucl_proj_norms.append(stat.get('fopng_eucl_proj_grad_norm_mean', 0))
+        
+        if not epochs:
+            return
+        
+        ax.plot(epochs, raw_norms, 'o-', label='Raw gradient ||g||', linewidth=2)
+        ax.plot(epochs, fisher_norms, 's-', label='Fisher space ||F^{1/2}g||', linewidth=2)
+        ax.plot(epochs, fisher_proj_norms, '^-', label='Fisher projected ||F^{1/2}P_g||', linewidth=2)
+        ax.plot(epochs, eucl_proj_norms, 'd-', label='Euclidean projected ||P_g||', linewidth=2)
+        
+        ax.set_xlabel('Training Progress (Task × 10 + Epoch)')
+        ax.set_ylabel('Gradient Norm')
+        ax.set_title(f'FOPNG Gradient Norms Through Transformation Pipeline')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        ax.set_yscale('log')
+        fig.tight_layout()
+        
+        if save and self.log_dir:
+            self.save_plot(fig, "fopng_gradient_norms")
+        
+        return fig
+    
+    def _create_fopng_relative_change_plot(self, save: bool = True):
+        """Plot how much FOPNG projection changes the gradient."""
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        epochs = []
+        relative_changes = []
+        
+        for stat in self.detailed_stats:
+            if 'fopng_projection_relative_change_mean' in stat:
+                epoch_id = stat['task_id'] * 10 + stat['epoch']
+                epochs.append(epoch_id)
+                relative_changes.append(stat.get('fopng_projection_relative_change_mean', 0))
+        
+        if not epochs:
+            return
+        
+        ax.plot(epochs, relative_changes, 'o-', color='crimson', linewidth=2, markersize=6)
+        ax.axhline(y=0, color='k', linestyle='--', linewidth=1, alpha=0.3)
+        
+        ax.set_xlabel('Training Progress (Task × 10 + Epoch)')
+        ax.set_ylabel('Relative Change: ||g - P_g|| / ||g||')
+        ax.set_title('FOPNG: Impact of Projection on Gradient')
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim(bottom=0)
+        fig.tight_layout()
+        
+        if save and self.log_dir:
+            self.save_plot(fig, "fopng_projection_relative_change")
+        
+        return fig
+    
+    def _create_ogd_relative_change_plot(self, save: bool = True):
+        """Plot how much OGD projection changes the gradient."""
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        epochs = []
+        relative_changes = []
+        
+        for stat in self.detailed_stats:
+            if 'ogd_projection_relative_change_mean' in stat:
+                epoch_id = stat['task_id'] * 10 + stat['epoch']
+                epochs.append(epoch_id)
+                relative_changes.append(stat.get('ogd_projection_relative_change_mean', 0))
+        
+        if not epochs:
+            return
+        
+        ax.plot(epochs, relative_changes, 'o-', color='steelblue', linewidth=2, markersize=6)
+        ax.axhline(y=0, color='k', linestyle='--', linewidth=1, alpha=0.3)
+        
+        ax.set_xlabel('Training Progress (Task × 10 + Epoch)')
+        ax.set_ylabel('Relative Change: ||g - g_proj|| / ||g||')
+        ax.set_title('OGD: Impact of Projection on Gradient')
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim(bottom=0)
+        fig.tight_layout()
+        
+        if save and self.log_dir:
+            self.save_plot(fig, "ogd_projection_relative_change")
+        
+        return fig
 
     def create_distribution_drift_plot(self, save: bool = True) -> plt.Figure:
         """Plot parameter drift over tasks."""
