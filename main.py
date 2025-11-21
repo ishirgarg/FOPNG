@@ -520,7 +520,7 @@ def main():
     parser.add_argument("--fisher", type=str, default="diagonal",
                         choices=["diagonal", "full"])
 
-    parser.add_argument("--max_directions", type=int, default=2000)
+    parser.add_argument("--max_directions", type=int, default=200)
 
     # FOPNG-specific
     parser.add_argument("--fopng_lambda_reg", type=float, default=0.0,
