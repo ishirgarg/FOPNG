@@ -72,7 +72,14 @@ def run_experiment(
     
     # Setup logger
     if logger is None and config.log_dir:
-        logger = ExperimentLogger(config.log_dir, config.experiment_name, config)
+        logger = ExperimentLogger(
+            config.log_dir, 
+            config.experiment_name, 
+            config,
+            project=config.wandb_project if config.use_wandb else 'fopng-experiments',
+            entity=config.wandb_entity,
+            tags=config.wandb_tags,
+        )
     
     if logger:
         logger.start_experiment(method.name, dataset_name, task_names)
@@ -105,11 +112,7 @@ def run_experiment(
             stats = result[2] if len(result) > 2 else None
             
             print(f"Epoch {epoch+1}/{config.epochs_per_task} | "
-                  f"Loss: {loss:.4f} | Acc: {acc*100:.2f}%", end='')
-            
-            if stats and 'grad_norm_mean' in stats:
-                print(f" | ||∇||: {stats['grad_norm_mean']:.2e}", end='')
-            print()
+                  f"Loss: {loss:.4f} | Acc: {acc*100:.2f}%")
             
             if logger:
                 logger.log_epoch(
@@ -117,11 +120,11 @@ def run_experiment(
                     epoch=epoch + 1,
                     train_loss=loss,
                     train_acc=acc,
-                    grad_norm_mean=stats.get('grad_norm_mean') if stats else None,
-                    grad_norm_std=stats.get('grad_norm_std') if stats else None,
-                    update_norm_mean=stats.get('update_norm_mean') if stats else None,
-                    update_norm_std=stats.get('update_norm_std') if stats else None,
-                    extra_stats=stats
+                    grad_norm_mean=None,  # No longer logging grad norms
+                    grad_norm_std=None,
+                    update_norm_mean=None,
+                    update_norm_std=None,
+                    extra_stats=None  # Don't log extra stats either
                 )
 
         # Compute empirical Fisher
@@ -145,6 +148,17 @@ def run_experiment(
                 'l2_distance': l2_dist
             })
             print(f"  Parameter drift: L2={l2_dist:.4f}, Fisher(train)={fisher_dist_train:.4f}, Fisher(test)={fisher_dist_test:.4f}")
+            
+            # Log parameter distances to wandb
+            from logger import log, _max_epochs_per_task
+            # Use same step calculation as eval - step of last epoch of task t
+            step = t * _max_epochs_per_task + config.epochs_per_task
+            log({
+                "param_drift/l2_distance": l2_dist,
+                "param_drift/fisher_distance_train": fisher_dist_train,
+                "param_drift/fisher_distance_test": fisher_dist_test,
+                "task": t,
+            }, step=step)
             
         prev_params = current_params.clone()
         
@@ -535,6 +549,16 @@ def main():
     parser.add_argument("--save_model", action="store_true", default=True)
     parser.add_argument("--save_plots", action="store_true", default=True)
     parser.add_argument("--save_raw_data", action="store_true", default=True)
+    
+    # Wandb configuration
+    parser.add_argument("--wandb_project", type=str, default="fopng",
+                        help="Wandb project name")
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                        help="Wandb entity/team name")
+    parser.add_argument("--wandb_tags", type=str, nargs="+", default=None,
+                        help="Tags for wandb run")
+    parser.add_argument("--no_wandb", action="store_true",
+                        help="Disable wandb logging")
 
     args = parser.parse_args()
 
@@ -558,6 +582,12 @@ def main():
         save_model=args.save_model,
         save_plots=args.save_plots,
         save_raw_data=args.save_raw_data,
+        
+        # Wandb configuration
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_tags=args.wandb_tags,
+        use_wandb=not args.no_wandb,
 
         # FOPNG specific
         fopng_lambda_reg=args.fopng_lambda_reg,

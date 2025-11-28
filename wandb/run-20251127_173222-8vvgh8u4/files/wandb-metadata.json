@@ -1,0 +1,55 @@
+{
+  "os": "macOS-14.4.1-arm64-arm-64bit-Mach-O",
+  "python": "CPython 3.13.3",
+  "startedAt": "2025-11-28T01:32:22.697960Z",
+  "args": [
+    "--dataset",
+    "split_mnist",
+    "--method",
+    "sgd",
+    "--num_tasks",
+    "5",
+    "--epochs",
+    "5",
+    "--lr",
+    "1e-3",
+    "--batch_size",
+    "10",
+    "--seed",
+    "42",
+    "--device",
+    "mps"
+  ],
+  "program": "/Users/ishirgarg/Github/FOPNG/main.py",
+  "codePath": "main.py",
+  "codePathLocal": "main.py",
+  "git": {
+    "remote": "https://github.com/ishirgarg/FOPNG",
+    "commit": "3d25a0c2bd4768ad45d655c063b998f70fb9ec9f"
+  },
+  "email": "ishirgarg@berkeley.edu",
+  "root": "/Users/ishirgarg/Github/FOPNG",
+  "host": "ishirs-mbp.lan",
+  "executable": "/Users/ishirgarg/Github/FOPNG/.venv/bin/python3",
+  "cpu_count": 10,
+  "cpu_count_logical": 10,
+  "disk": {
+    "/": {
+      "total": "994662584320",
+      "used": "831338696704"
+    }
+  },
+  "memory": {
+    "total": "34359738368"
+  },
+  "apple": {
+    "name": "Apple M2 Pro",
+    "ecpuCores": 4,
+    "pcpuCores": 6,
+    "gpuCores": 16,
+    "memoryGb": 32,
+    "swapTotalBytes": "42949672960",
+    "ramTotalBytes": "34359738368"
+  },
+  "writerId": "mn920i71rs1qgjgukab2jl4n5syuewc4"
+}

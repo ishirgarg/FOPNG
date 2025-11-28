@@ -18,6 +18,12 @@ class Config:
     save_plots: bool
     save_raw_data: bool
     experiment_name: Optional[str] = "noname"
+    
+    # Wandb configuration
+    wandb_project: Optional[str] = "fopng-experiments"
+    wandb_entity: Optional[str] = None
+    wandb_tags: Optional[list] = None
+    use_wandb: bool = True  # Set to False to disable wandb logging
 
     # FOPNG specific
     fopng_lambda_reg: float = 0.0
@@ -34,4 +40,8 @@ class Config:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary for serialization."""
-        return {k: v for k, v in asdict(self).items() if not k.startswith('_')}
+        # Filter out logging-related config that shouldn't be logged as metrics
+        exclude_keys = {'log_dir', 'save_model', 'save_plots', 'save_raw_data', 
+                       'wandb_project', 'wandb_entity', 'wandb_tags', 'use_wandb'}
+        return {k: v for k, v in asdict(self).items() 
+                if not k.startswith('_') and k not in exclude_keys}
