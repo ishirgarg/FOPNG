@@ -27,6 +27,7 @@ class Config:
 
     # FOPNG specific
     fopng_lambda_reg: float = 0.0
+    fopng_new_fisher_weight: float = 0.5  # Weight for new Fisher: F_old = (1-w)*F_old + w*F_current
     
     def __post_init__(self):
         if self.device == "auto":

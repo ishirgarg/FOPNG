@@ -527,6 +527,8 @@ def main():
     # FOPNG-specific
     parser.add_argument("--fopng_lambda_reg", type=float, default=0.0,
                         help="Regularization parameter for FOPNG")
+    parser.add_argument("--fopng_new_fisher_weight", type=float, default=0.5,
+                        help="Weight for new Fisher in weighted average: F_old = (1-w)*F_old + w*F_current")
 
     # --------------------------------
     # Logging / saving
@@ -577,6 +579,7 @@ def main():
 
         # FOPNG specific
         fopng_lambda_reg=args.fopng_lambda_reg,
+        fopng_new_fisher_weight=args.fopng_new_fisher_weight,
     )
 
     # --------------------------------------------------------------------

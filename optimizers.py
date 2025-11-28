@@ -489,8 +489,8 @@ class FOPNGMethod(ContinualMethod):
         if self.F_old is None:
             self.F_old = F_current
         else:
-            # Combine Fisher information from old and current tasks
-            self.F_old = (self.F_old + F_current) / 2
+            w = getattr(config, 'fopng_new_fisher_weight')
+            self.F_old = (1 - w) * self.F_old + w * F_current
         
         # Collect gradients
         print(f"Collecting FOPNG directions from task {task_id}...")

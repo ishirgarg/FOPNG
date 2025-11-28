@@ -1,43 +1,65 @@
 #!/bin/bash
 
-for seed in {1..5}
-do
-  echo "Running OGD seed $seed"
-  python3 main.py \
-      --dataset rotated_mnist \
-      --method ogd \
-      --num_tasks 5 \
-      --epochs 5 \
-      --lr 1e-3 \
-      --collector gtl \
-      --max_directions 200 \
-      --batch_size 10 \
-      --seed $seed \
-      --device mps
+datasets=(rotated_mnist split_mnist permuted_mnist)
+seeds=$(seq 1 5)
 
-  echo "Running FOPNG seed $seed"
-  python3 main.py \
-      --dataset rotated_mnist \
-      --method fopng \
-      --fisher diagonal \
-      --num_tasks 5 \
-      --epochs 5 \
-      --lr 1e-4 \
-      --collector gtl \
-      --max_directions 200 \
-      --fopng_lambda_reg 1e-3 \
-      --batch_size 10 \
-      --seed $seed \
-      --device mps
+# Learning rate sweeps (6 values each)
+lrs_ogd=(1e-5 5e-5 1e-4 5e-4 1e-3 5e-3)
+lrs_fopng=(5e-6 1e-5 5e-5 1e-4 5e-4 1e-3)
+lrs_sgd=(5e-5 1e-4 5e-4 1e-3 5e-3 1e-2)
 
-  echo "Running SGD seed $seed"
-  python3 main.py \
-      --dataset rotated_mnist \
-      --method sgd \
-      --num_tasks 5 \
-      --epochs 5 \
-      --lr 1e-3 \
-      --batch_size 10 \
-      --seed $seed \
-      --device mps
+for dataset in "${datasets[@]}"; do
+  for seed in $seeds; do
+
+    echo "==== DATASET $dataset | SEED $seed ===="
+
+    # ---------------------- OGD ----------------------
+    for lr in "${lrs_ogd[@]}"; do
+      echo "Running OGD (lr=$lr, seed=$seed) on $dataset"
+      python3 main.py \
+          --dataset "$dataset" \
+          --method ogd \
+          --num_tasks 5 \
+          --epochs 5 \
+          --lr "$lr" \
+          --collector gtl \
+          --max_directions 200 \
+          --batch_size 10 \
+          --seed "$seed" \
+          --device mps
+    done
+
+    # ---------------------- FOPNG ----------------------
+    for lr in "${lrs_fopng[@]}"; do
+      echo "Running FOPNG (lr=$lr, seed=$seed) on $dataset"
+      python3 main.py \
+          --dataset "$dataset" \
+          --method fopng \
+          --fisher diagonal \
+          --num_tasks 5 \
+          --epochs 5 \
+          --lr "$lr" \
+          --collector gtl \
+          --max_directions 200 \
+          --fopng_lambda_reg 1e-3 \
+          --fopng_new_fisher_weight 0.5 \
+          --batch_size 10 \
+          --seed "$seed" \
+          --device mps
+    done
+
+    # ---------------------- SGD ----------------------
+    for lr in "${lrs_sgd[@]}"; do
+      echo "Running SGD (lr=$lr, seed=$seed) on $dataset"
+      python3 main.py \
+          --dataset "$dataset" \
+          --method sgd \
+          --num_tasks 5 \
+          --epochs 5 \
+          --lr "$lr" \
+          --batch_size 10 \
+          --seed "$seed" \
+          --device mps
+    done
+  done
 done
