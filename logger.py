@@ -40,6 +40,7 @@ _current_step: int = 0
 _task_id: int = 0
 _epoch: int = 0
 _max_epochs_per_task: int = 1000  # Used for step calculation - will be updated from config
+_eval_step: int = 10000  # Separate counter for eval logging to avoid conflicts
 
 
 def init_wandb(
@@ -200,7 +201,9 @@ class ExperimentLogger:
             )
         
         # Minimal storage - only what's needed for plots
-        self.results: Dict[int, List[float]] = {}  # Only for generating plots
+        self.results: Dict[int, Dict[str, List[float]]] = {}  # {task_id: {'test': [...], 'train': [...]}}
+        self.epoch_logs: List[Dict[str, Any]] = []  # Per-epoch training logs
+        self.eval_logs: List[Dict[str, Any]] = []  # Evaluation logs
         self.task_names: Optional[List[str]] = None
         self.method_name: str = ""
         self.dataset_name: str = ""
@@ -252,8 +255,8 @@ class ExperimentLogger:
         update_norm_std: Optional[float] = None,
         extra_stats: Optional[Dict[str, Any]] = None
     ):
-        """Log training epoch data - logs directly to wandb, no storage."""
-        # Log directly to wandb - only log loss and accuracy, no grad norms
+        """Log training epoch data - logs directly to wandb and stores locally."""
+        # Log directly to wandb
         metrics = {
             f"train/task_{task_id}/loss": train_loss,
             f"train/task_{task_id}/accuracy": train_acc,
@@ -264,6 +267,15 @@ class ExperimentLogger:
         global _max_epochs_per_task
         step = task_id * _max_epochs_per_task + epoch
         log(metrics, step=step)
+        
+        # Store locally for CSV export
+        self.epoch_logs.append({
+            'task_id': task_id,
+            'epoch': epoch,
+            'step': step,
+            'train_loss': train_loss,
+            'train_accuracy': train_acc,
+        })
     
     def log_eval(
         self,
@@ -274,31 +286,50 @@ class ExperimentLogger:
         train_loss: float,
         train_acc: float
     ):
-        """Log evaluation results - logs directly to wandb and updates results for plots."""
-        # Log directly to wandb - log task accuracy as function of tasks trained
-        # Use the step of the last epoch of the trained task
-        # Last epoch step = task_id * max_epochs + epochs_per_task
-        global _max_epochs_per_task
-        epochs_per_task = self.config.epochs_per_task if self.config and hasattr(self.config, 'epochs_per_task') else 1
-        step = trained_task * _max_epochs_per_task + epochs_per_task
+        """Log evaluation results - logs directly to wandb and stores locally."""
+        # Log to wandb using a separate step counter to avoid conflicts with training steps
+        global _eval_step
         
-        # Log to training/ section: task accuracy as function of tasks trained
-        # trained_task + 1 represents how many tasks have been trained so far
+        # Log to wandb: separate train and test accuracy as function of tasks trained
         metrics = {
-            f"train/task_{eval_task}/accuracy_vs_tasks_trained": eval_acc,
+            f"eval/task_{eval_task}/test_accuracy_vs_tasks_trained": eval_acc,
+            f"eval/task_{eval_task}/train_accuracy_vs_tasks_trained": train_acc,
         }
-        log(metrics, step=step)
+        log(metrics, step=_eval_step)
+        _eval_step += 1
         
-        # Only store results for plot generation (minimal storage)
+        # Store results for plot generation (separate train/test)
         if eval_task not in self.results:
-            self.results[eval_task] = []
-        self.results[eval_task].append(eval_acc)
+            self.results[eval_task] = {'test': [], 'train': []}
+        self.results[eval_task]['test'].append(eval_acc)
+        self.results[eval_task]['train'].append(train_acc)
+        
+        # Store locally for CSV export
+        self.eval_logs.append({
+            'trained_task': trained_task,
+            'eval_task': eval_task,
+            'step': _eval_step - 1,
+            'test_loss': eval_loss,
+            'test_accuracy': eval_acc,
+            'train_loss': train_loss,
+            'train_accuracy': train_acc,
+        })
     
     def set_results(self, results: Dict[int, List[float]]):
-        """Set final results dictionary."""
-        self.results = results
+        """Set final results dictionary (for backward compatibility).
         
-        # Don't log final accuracies separately - they're already logged in log_eval
+        This method expects the old format with only test accuracies.
+        It will convert it to the new format with separate train/test data.
+        Note: This will LOSE any train accuracy data that was previously logged.
+        Prefer not to call this method and let log_eval populate results instead.
+        """
+        # Convert old format (test-only) to new format
+        for task_id, test_accs in results.items():
+            if task_id not in self.results:
+                self.results[task_id] = {'test': [], 'train': []}
+            # Only update test accs if not already populated
+            if not self.results[task_id].get('test'):
+                self.results[task_id]['test'] = test_accs
     
     def end_experiment(self):
         """Called at experiment end."""
@@ -339,11 +370,12 @@ class ExperimentLogger:
                 wandb.log({f"plots/{name}": wandb.Image(fig)})
     
     def create_accuracy_plot(self, save: bool = True) -> plt.Figure:
-        """Create accuracy progression plot showing per-task accuracy vs tasks trained."""
+        """Create accuracy progression plot showing per-task test accuracy vs tasks trained."""
         fig, ax = plt.subplots(figsize=(10, 6))
         
-        # Plot one line per task, showing how its accuracy changes as more tasks are trained
-        for task_id, acc_list in sorted(self.results.items()):
+        # Plot one line per task, showing how its test accuracy changes as more tasks are trained
+        for task_id in sorted(self.results.keys()):
+            acc_list = self.results[task_id].get('test', []) if isinstance(self.results[task_id], dict) else self.results[task_id]
             label = self.task_names[task_id] if self.task_names else f"Task {task_id}"
             # x-axis: number of tasks trained so far (1, 2, 3, ...)
             # y-axis: accuracy on this task
@@ -351,20 +383,48 @@ class ExperimentLogger:
             ax.plot(x_values, acc_list, marker='o', linewidth=2, markersize=6, label=label)
         
         ax.set_xlabel("After training task k", fontsize=12)
-        ax.set_ylabel("Accuracy", fontsize=12)
-        title = f"{self.dataset_name} — {self.method_name}"
+        ax.set_ylabel("Test Accuracy", fontsize=12)
+        title = f"{self.dataset_name} — {self.method_name} (Test)"
         ax.set_title(title, fontsize=14)
         ax.legend(loc='best', fontsize=10)
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
         
         if save:
-            self.save_plot(fig, "accuracy_progression")
+            self.save_plot(fig, "accuracy_progression_test")
+        
+        return fig
+    
+    def create_train_accuracy_plot(self, save: bool = True) -> plt.Figure:
+        """Create accuracy progression plot showing per-task train accuracy vs tasks trained."""
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # Plot one line per task, showing how its train accuracy changes as more tasks are trained
+        for task_id in sorted(self.results.keys()):
+            acc_list = self.results[task_id].get('train', []) if isinstance(self.results[task_id], dict) else []
+            if not acc_list:
+                continue
+            label = self.task_names[task_id] if self.task_names else f"Task {task_id}"
+            # x-axis: number of tasks trained so far (1, 2, 3, ...)
+            # y-axis: accuracy on this task
+            x_values = range(1, len(acc_list) + 1)
+            ax.plot(x_values, acc_list, marker='s', linewidth=2, markersize=6, label=label)
+        
+        ax.set_xlabel("After training task k", fontsize=12)
+        ax.set_ylabel("Train Accuracy", fontsize=12)
+        title = f"{self.dataset_name} — {self.method_name} (Train)"
+        ax.set_title(title, fontsize=14)
+        ax.legend(loc='best', fontsize=10)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        
+        if save:
+            self.save_plot(fig, "accuracy_progression_train")
         
         return fig
     
     def create_forgetting_plot(self, save: bool = True) -> plt.Figure:
-        """Create forgetting visualization."""
+        """Create forgetting visualization for test accuracy."""
         fig, ax = plt.subplots(figsize=(8, 5))
         
         num_tasks = len(self.results)
@@ -372,12 +432,14 @@ class ExperimentLogger:
         task_labels = []
         
         for t in range(num_tasks - 1):
-            if t in self.results and len(self.results[t]) > 1:
-                max_acc = max(self.results[t])
-                final_acc = self.results[t][-1]
-                forgetting.append((max_acc - final_acc) * 100)
-                label = self.task_names[t] if self.task_names else f"Task {t}"
-                task_labels.append(label)
+            if t in self.results:
+                acc_data = self.results[t].get('test', []) if isinstance(self.results[t], dict) else self.results[t]
+                if len(acc_data) > 1:
+                    max_acc = max(acc_data)
+                    final_acc = acc_data[-1]
+                    forgetting.append((max_acc - final_acc) * 100)
+                    label = self.task_names[t] if self.task_names else f"Task {t}"
+                    task_labels.append(label)
         
         if forgetting:
             x = range(len(forgetting))
@@ -385,43 +447,45 @@ class ExperimentLogger:
             ax.set_xticks(x)
             ax.set_xticklabels(task_labels, rotation=45, ha='right')
             ax.set_ylabel("Forgetting (%)")
-            ax.set_title(f"Forgetting per Task — {self.method_name}")
+            ax.set_title(f"Test Forgetting per Task — {self.method_name}")
             ax.axhline(y=0, color='k', linestyle='-', linewidth=0.5)
             fig.tight_layout()
         
         if save:
-            self.save_plot(fig, "forgetting")
+            self.save_plot(fig, "forgetting_test")
         
         return fig
     
-    def create_training_curves_plot(self, save: bool = True) -> plt.Figure:
-        """Create merged plot showing task accuracy as function of tasks trained for all tasks."""
-        # Build data structure: for each task, track accuracy vs tasks trained
-        # results[task_id] = [acc_after_task_0, acc_after_task_1, ...]
+    def create_train_forgetting_plot(self, save: bool = True) -> plt.Figure:
+        """Create forgetting visualization for train accuracy."""
+        fig, ax = plt.subplots(figsize=(8, 5))
         
-        if not self.results:
-            return None
+        num_tasks = len(self.results)
+        forgetting = []
+        task_labels = []
         
-        fig, ax = plt.subplots(figsize=(10, 6))
+        for t in range(num_tasks - 1):
+            if t in self.results:
+                acc_data = self.results[t].get('train', []) if isinstance(self.results[t], dict) else []
+                if len(acc_data) > 1:
+                    max_acc = max(acc_data)
+                    final_acc = acc_data[-1]
+                    forgetting.append((max_acc - final_acc) * 100)
+                    label = self.task_names[t] if self.task_names else f"Task {t}"
+                    task_labels.append(label)
         
-        # Plot one line per task, showing how its accuracy changes as more tasks are trained
-        for task_id, acc_list in sorted(self.results.items()):
-            label = self.task_names[task_id] if self.task_names else f"Task {task_id}"
-            # x-axis: number of tasks trained so far (1, 2, 3, ...)
-            # y-axis: accuracy on this task
-            x_values = range(1, len(acc_list) + 1)
-            ax.plot(x_values, acc_list, marker='o', linewidth=2, markersize=6, label=label)
-        
-        ax.set_xlabel("After training task k", fontsize=12)
-        ax.set_ylabel("Task Accuracy", fontsize=12)
-        title = f"{self.dataset_name} — {self.method_name}"
-        ax.set_title(title, fontsize=14)
-        ax.legend(loc='best', fontsize=10)
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
+        if forgetting:
+            x = range(len(forgetting))
+            ax.bar(x, forgetting, color='lightblue')
+            ax.set_xticks(x)
+            ax.set_xticklabels(task_labels, rotation=45, ha='right')
+            ax.set_ylabel("Forgetting (%)")
+            ax.set_title(f"Train Forgetting per Task — {self.method_name}")
+            ax.axhline(y=0, color='k', linestyle='-', linewidth=0.5)
+            fig.tight_layout()
         
         if save:
-            self.save_plot(fig, "training_task_accuracy_vs_tasks_trained")
+            self.save_plot(fig, "forgetting_train")
         
         return fig
     
@@ -454,10 +518,10 @@ class ExperimentLogger:
     
     def create_all_plots(self):
         """Create and save all standard plots."""
-        self.create_accuracy_plot(save=True)
-        self.create_forgetting_plot(save=True)
-        # Create merged plot for training task accuracy vs tasks trained
-        self.create_training_curves_plot(save=True)
+        self.create_accuracy_plot(save=True)  # Test accuracy
+        self.create_train_accuracy_plot(save=True)  # Train accuracy
+        self.create_forgetting_plot(save=True)  # Test forgetting
+        self.create_train_forgetting_plot(save=True)  # Train forgetting
         self.create_distribution_drift_plot(save=True)
         plt.close('all')
     
@@ -488,7 +552,23 @@ class ExperimentLogger:
                 'dataset_name': self.dataset_name,
             }, f, indent=2)
         
-        # Save results matrix CSV (only thing we have data for)
+        # Save epoch logs as CSV
+        if self.epoch_logs:
+            epoch_csv_path = self.log_dir / "epoch_logs.csv"
+            with open(epoch_csv_path, 'w') as f:
+                f.write('task_id,epoch,step,train_loss,train_accuracy\n')
+                for log in self.epoch_logs:
+                    f.write(f"{log['task_id']},{log['epoch']},{log['step']},{log['train_loss']:.6f},{log['train_accuracy']:.6f}\n")
+        
+        # Save eval logs as CSV
+        if self.eval_logs:
+            eval_csv_path = self.log_dir / "eval_logs.csv"
+            with open(eval_csv_path, 'w') as f:
+                f.write('trained_task,eval_task,step,test_loss,test_accuracy,train_loss,train_accuracy\n')
+                for log in self.eval_logs:
+                    f.write(f"{log['trained_task']},{log['eval_task']},{log['step']},{log['test_loss']:.6f},{log['test_accuracy']:.6f},{log['train_loss']:.6f},{log['train_accuracy']:.6f}\n")
+        
+        # Save test accuracy matrix CSV
         if self.results:
             csv_path = self.log_dir / "accuracy_matrix.csv"
             num_tasks = len(self.results)
@@ -497,7 +577,24 @@ class ExperimentLogger:
                 f.write(','.join(headers) + '\n')
                 for task_id in range(num_tasks):
                     row = [str(task_id)]
-                    for i, acc in enumerate(self.results.get(task_id, [])):
+                    acc_data = self.results.get(task_id, {})
+                    test_accs = acc_data.get('test', []) if isinstance(acc_data, dict) else acc_data
+                    for acc in test_accs:
+                        row.append(f'{acc:.6f}')
+                    while len(row) < num_tasks + 1:
+                        row.append('')
+                    f.write(','.join(row) + '\n')
+            
+            # Save train accuracy matrix CSV
+            csv_train_path = self.log_dir / "train_accuracy_matrix.csv"
+            with open(csv_train_path, 'w') as f:
+                headers = ['eval_task'] + [f'after_task_{i}' for i in range(num_tasks)]
+                f.write(','.join(headers) + '\n')
+                for task_id in range(num_tasks):
+                    row = [str(task_id)]
+                    acc_data = self.results.get(task_id, {})
+                    train_accs = acc_data.get('train', []) if isinstance(acc_data, dict) else []
+                    for acc in train_accs:
                         row.append(f'{acc:.6f}')
                     while len(row) < num_tasks + 1:
                         row.append('')
@@ -525,6 +622,8 @@ class ExperimentLogger:
         data = {
             'metadata': self.get_metadata(),
             'results': self.results,
+            'epoch_logs': self.epoch_logs,
+            'eval_logs': self.eval_logs,
         }
         if hasattr(self, 'param_distances'):
             data['param_distances'] = self.param_distances

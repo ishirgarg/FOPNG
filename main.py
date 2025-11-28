@@ -190,8 +190,9 @@ def run_experiment(
     
     # Finalize logging
     if logger:
-        logger.set_results(dict(results))
-        logger.train_results = dict(train_results)  # Add this
+        # Note: logger.results is already populated during log_eval calls with both train/test data
+        # Don't overwrite it with set_results - that would lose the train accuracy data
+        logger.train_results = dict(train_results)  # Store for reference
         logger.end_experiment()
         logger.param_distances = param_distances
         
