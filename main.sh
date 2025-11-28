@@ -22,11 +22,10 @@ do
       --fisher diagonal \
       --num_tasks 5 \
       --epochs 5 \
-      --lr 1e-3 \
+      --lr 1e-4 \
       --collector gtl \
       --max_directions 200 \
       --fopng_lambda_reg 1e-3 \
-      --fopng_epsilon 1e-4 \
       --batch_size 10 \
       --seed $seed \
       --device mps

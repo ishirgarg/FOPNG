@@ -12,6 +12,7 @@ from gradients import GradientMemory, GradientCollector, GTLCollector, AVECollec
 from fisher import FisherEstimator, DiagonalFisherEstimator, FullFisherEstimator
 from utils import get_param_count, apply_update
 from gradients import get_grad_vector, set_grad_vector
+from logger import log
 
 class ContinualMethod(ABC):
     """Abstract base class for continual learning methods."""
@@ -149,6 +150,11 @@ class OGDMethod(ContinualMethod):
         total_correct = 0
         total_samples = 0
         
+        # Accumulators for gradient norms and ratios (log average per epoch)
+        raw_grad_norms = []
+        proj_grad_norms = []
+        proj_to_raw_ratios = []
+        
         iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
         
         for x, y in iterator:
@@ -165,11 +171,21 @@ class OGDMethod(ContinualMethod):
             loss = criterion(logits, y)
             loss.backward()
             
+            # Get raw gradient and compute norm
+            g = get_grad_vector(model)
+            raw_norm = g.norm().item()
+            raw_grad_norms.append(raw_norm)
+            
             # Project gradient if we have stored directions
             if len(self.memory) > 0:
-                g = get_grad_vector(model)
                 g_tilde = self.memory.project_orthogonal(g)
+                proj_norm = g_tilde.norm().item()
+                proj_grad_norms.append(proj_norm)
+                proj_to_raw_ratios.append(proj_norm / (raw_norm + 1e-8))
                 set_grad_vector(model, g_tilde)
+            else:
+                proj_grad_norms.append(raw_norm)  # No projection, same as raw
+                proj_to_raw_ratios.append(1.0)  # Ratio is 1 when no projection
             
             optimizer.step()
             
@@ -177,6 +193,14 @@ class OGDMethod(ContinualMethod):
             preds = logits.argmax(dim=1)
             total_correct += (preds == y).sum().item()
             total_samples += x.size(0)
+        
+        # Log average gradient norms and ratios for this epoch (task-specific plots)
+        log({
+            f"grad_norms_task_{task_id}/ogd_raw_gradient": np.mean(raw_grad_norms),
+            f"grad_norms_task_{task_id}/ogd_projected_gradient": np.mean(proj_grad_norms),
+            f"grad_ratios_task_{task_id}/ogd_projected_to_raw": np.mean(proj_to_raw_ratios),
+            "task_id": task_id,
+        })
         
         return total_loss / total_samples, total_correct / total_samples
     
@@ -254,9 +278,14 @@ class FOPNGMethod(ContinualMethod):
         G: torch.Tensor,
         device: str,
         lr: float
-    ) -> torch.Tensor:
-        """Compute FOPNG update step."""
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Compute FOPNG update step.
+        
+        Returns:
+            Tuple of (update vector, dict of norms and ratios for logging)
+        """
         lam = self.lambda_reg
+        norms = {}
 
         if self.is_diagonal:
             F_new_inv_diag = 1.0 / (F_new + lam)
@@ -268,6 +297,17 @@ class FOPNGMethod(ContinualMethod):
             F_new_inv_P_g = P_g * F_new_inv_diag
             denom = torch.sqrt((P_g * F_new_inv_P_g).sum() + 1e-8)
             v_star = -lr * F_new_inv_P_g / (denom + 1e-8)
+            
+            # Compute norms and ratios for logging
+            raw_norm = gradient.norm().item()
+            correction_norm = correction.norm().item()
+            v_star_norm = v_star.norm().item()
+            
+            norms['raw_gradient'] = raw_norm
+            norms['correction'] = correction_norm
+            norms['v_star'] = v_star_norm
+            norms['correction_to_raw_ratio'] = correction_norm / (raw_norm + 1e-8)
+            norms['v_star_to_raw_ratio'] = v_star_norm / (raw_norm + 1e-8)
         else:
             # Full Fisher
             F_new_inv = torch.inverse(F_new + lam * torch.eye(F_new.size(0), device=device))
@@ -279,8 +319,19 @@ class FOPNGMethod(ContinualMethod):
             F_new_inv_P_g = F_new_inv @ P_g
             denom = torch.sqrt(P_g @ F_new_inv_P_g + 1e-8)
             v_star = -lr * F_new_inv_P_g / denom
+            
+            # Compute norms and ratios for logging
+            raw_norm = gradient.norm().item()
+            correction_norm = correction.norm().item()
+            v_star_norm = v_star.norm().item()
+            
+            norms['raw_gradient'] = raw_norm
+            norms['correction'] = correction_norm
+            norms['v_star'] = v_star_norm
+            norms['correction_to_raw_ratio'] = correction_norm / (raw_norm + 1e-8)
+            norms['v_star_to_raw_ratio'] = v_star_norm / (raw_norm + 1e-8)
         
-        return v_star
+        return v_star, norms
     
     def train_epoch(
         self,
@@ -316,6 +367,13 @@ class FOPNGMethod(ContinualMethod):
         self._compute_update_prep(F_new, self.F_old, G, config.device)
         iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
         
+        # Accumulators for gradient norms and ratios (log average per epoch)
+        raw_grad_norms = []
+        correction_norms = []
+        v_star_norms = []
+        correction_to_raw_ratios = []
+        v_star_to_raw_ratios = []
+        
         for x, y in iterator:
             x = x.to(config.device)
             y = y.to(config.device)
@@ -330,13 +388,30 @@ class FOPNGMethod(ContinualMethod):
             loss.backward()
             
             grad = get_grad_vector(model)
-            update = self._compute_update(grad, F_new, self.F_old, G, config.device, config.lr)
+            update, norms = self._compute_update(grad, F_new, self.F_old, G, config.device, config.lr)
             apply_update(model, update)
+            
+            # Accumulate norms and ratios
+            raw_grad_norms.append(norms['raw_gradient'])
+            correction_norms.append(norms['correction'])
+            v_star_norms.append(norms['v_star'])
+            correction_to_raw_ratios.append(norms['correction_to_raw_ratio'])
+            v_star_to_raw_ratios.append(norms['v_star_to_raw_ratio'])
             
             total_loss += loss.item() * x.size(0)
             preds = output.argmax(dim=1)
             total_correct += (preds == y).sum().item()
             total_samples += x.size(0)
+        
+        # Log average gradient norms and ratios for this epoch (task-specific plots)
+        log({
+            f"grad_norms_task_{task_id}/fopng_raw_gradient": np.mean(raw_grad_norms),
+            f"grad_norms_task_{task_id}/fopng_correction": np.mean(correction_norms),
+            f"grad_norms_task_{task_id}/fopng_v_star": np.mean(v_star_norms),
+            f"grad_ratios_task_{task_id}/fopng_correction_to_raw": np.mean(correction_to_raw_ratios),
+            f"grad_ratios_task_{task_id}/fopng_v_star_to_raw": np.mean(v_star_to_raw_ratios),
+            "task_id": task_id,
+        })
         
         return total_loss / total_samples, total_correct / total_samples
     
@@ -357,6 +432,9 @@ class FOPNGMethod(ContinualMethod):
         total_correct = 0
         total_samples = 0
         
+        # Accumulators for gradient norms (log average per epoch)
+        raw_grad_norms = []
+        
         iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
         
         for x, y in iterator:
@@ -372,12 +450,27 @@ class FOPNGMethod(ContinualMethod):
             
             loss = criterion(logits, y)
             loss.backward()
+            
+            # Get raw gradient norm before optimizer step
+            grad = get_grad_vector(model)
+            raw_grad_norms.append(grad.norm().item())
+            
             optimizer.step()
             
             total_loss += loss.item() * x.size(0)
             preds = logits.argmax(dim=1)
             total_correct += (preds == y).sum().item()
             total_samples += x.size(0)
+        
+        # Log average gradient norms for this epoch (task-specific plots, no correction/v_star for task 0)
+        log({
+            f"grad_norms_task_{task_id}/fopng_raw_gradient": np.mean(raw_grad_norms),
+            f"grad_norms_task_{task_id}/fopng_correction": 0.0,  # No correction for task 0
+            f"grad_norms_task_{task_id}/fopng_v_star": 0.0,  # No v_star for task 0
+            f"grad_ratios_task_{task_id}/fopng_correction_to_raw": 0.0,  # No correction for task 0
+            f"grad_ratios_task_{task_id}/fopng_v_star_to_raw": 0.0,  # No v_star for task 0
+            "task_id": task_id,
+        })
         
         return total_loss / total_samples, total_correct / total_samples
     
