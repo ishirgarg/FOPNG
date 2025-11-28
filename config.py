@@ -27,7 +27,6 @@ class Config:
 
     # FOPNG specific
     fopng_lambda_reg: float = 0.0
-    fopng_epsilon: float = 0.0
     
     def __post_init__(self):
         if self.device == "auto":

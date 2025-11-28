@@ -7,17 +7,17 @@ Usage:
     
     init_wandb(project="my-project", name="exp-1", config=config)
     
-    # Log metrics from anywhere in your code
-    log({"train_loss": 0.5, "train_acc": 0.9}, step=100)
-    log({"eval/accuracy": 0.85}, step=200)
+    # Log metrics from anywhere - step auto-increments
+    log({"train_loss": 0.5, "train_acc": 0.9})
+    log({"eval/accuracy": 0.85})
     
-    # Or use the logger instance directly
-    from logger import wandb_logger
-    wandb_logger.log({"metric": value})
+    # Or use the ExperimentLogger for structured logging
+    logger = ExperimentLogger(config, log_dir, "method", "dataset")
+    logger.log_epoch(task_id=0, epoch=1, train_loss=0.5, train_acc=0.9)
 """
 
-# Export _max_epochs_per_task for step calculation consistency
-__all__ = ['init_wandb', 'log', 'set_step', 'set_task_epoch', 'finish', 'ExperimentLogger', '_max_epochs_per_task']
+# Export get_step for consistent step access
+__all__ = ['init_wandb', 'log', 'get_step', 'finish', 'ExperimentLogger']
 
 import wandb
 from typing import Any, Dict, List, Optional, Union
@@ -28,6 +28,7 @@ import json
 import pickle
 from collections import defaultdict
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from torch import nn
 
@@ -36,11 +37,7 @@ from config import Config
 
 # Global logger instance - initialized by init_wandb()
 _wandb_run: Optional[wandb.run] = None
-_current_step: int = 0
-_task_id: int = 0
-_epoch: int = 0
-_max_epochs_per_task: int = 1000  # Used for step calculation - will be updated from config
-_eval_step: int = 10000  # Separate counter for eval logging to avoid conflicts
+_global_step: int = 0  # Single global step counter - always increments
 
 
 def init_wandb(
@@ -66,11 +63,11 @@ def init_wandb(
         use_wandb: Whether to actually initialize wandb (False = no-op)
         **kwargs: Additional arguments passed to wandb.init
     """
-    global _wandb_run, _current_step
+    global _wandb_run, _global_step
     
     if not use_wandb:
         _wandb_run = None
-        _current_step = 0
+        _global_step = 0
         return
     
     if _wandb_run is not None:
@@ -97,60 +94,49 @@ def init_wandb(
         **kwargs
     )
     
-    _current_step = 0
+    _global_step = 0
+    
+    # Define custom x-axes for meaningful chart displays
+    # Training metrics use task_id as x-axis (which task we're training)
+    wandb.define_metric("task_id")
+    wandb.define_metric("train/*", step_metric="task_id")
+    
+    # Evaluation metrics use trained_task as x-axis (how many tasks trained so far)
+    wandb.define_metric("trained_task")
+    wandb.define_metric("accuracy_progression/*", step_metric="trained_task")
+    wandb.define_metric("loss/*", step_metric="trained_task")
+    wandb.define_metric("param_drift/*", step_metric="trained_task")
+    
     print(f"Wandb initialized: {_wandb_run.url}")
 
 
 def log(metrics: Dict[str, Any], step: Optional[int] = None, commit: bool = True):
     """
-    Log metrics to wandb. Can be called from anywhere in the code.
+    Log metrics to wandb using the global step counter.
     
-    This is the simplest way to log metrics - just import and call:
-        from logger import log
-        log({"my_metric": value})
+    The step counter always increments to ensure monotonically increasing steps.
     
     Args:
         metrics: Dictionary of metric names to values
-        step: Step number (defaults to internal counter)
+        step: Ignored - always uses global counter for consistency
         commit: Whether to commit this log entry (default True)
     
     Examples:
-        # Basic usage - logs to wandb automatically
-        log({"train_loss": 0.5, "train_acc": 0.9})
-        
-        # With explicit step
-        log({"eval/accuracy": 0.85}, step=100)
-        
-        # Log from anywhere - optimizers, utils, etc.
         from logger import log
-        log({"custom_metric": value, "another_metric": value2})
+        log({"my_metric": value})  # Uses next global step
     """
-    global _current_step
+    global _global_step
     
     if _wandb_run is None:
-        # Silently ignore if wandb is disabled
         return
     
-    if step is None:
-        step = _current_step
-    
-    _wandb_run.log(metrics, step=step, commit=commit)
-    
-    if step is None:
-        _current_step += 1
+    _wandb_run.log(metrics, step=_global_step, commit=commit)
+    _global_step += 1
 
 
-def set_step(step: int):
-    """Set the current step counter."""
-    global _current_step
-    _current_step = step
-
-
-def set_task_epoch(task_id: int, epoch: int):
-    """Set current task and epoch for convenience."""
-    global _task_id, _epoch
-    _task_id = task_id
-    _epoch = epoch
+def get_step() -> int:
+    """Get the current global step (for reference/logging purposes)."""
+    return _global_step
 
 
 def finish():
@@ -235,44 +221,34 @@ class ExperimentLogger:
         log({
             "experiment/method": method_name,
             "experiment/dataset": dataset_name,
-        }, step=0)
-        
-        # Set max epochs per task from config if available
-        global _max_epochs_per_task
-        if self.config and hasattr(self.config, 'epochs_per_task'):
-            # Use a multiplier that's at least 1000 to ensure room for epochs
-            _max_epochs_per_task = max(1000, self.config.epochs_per_task * 2)
+        })
     
     def log_epoch(
         self,
         task_id: int,
         epoch: int,
         train_loss: float,
-        train_acc: float,
-        grad_norm_mean: Optional[float] = None,
-        grad_norm_std: Optional[float] = None,
-        update_norm_mean: Optional[float] = None,
-        update_norm_std: Optional[float] = None,
-        extra_stats: Optional[Dict[str, Any]] = None
+        train_acc: float
     ):
         """Log training epoch data - logs directly to wandb and stores locally."""
-        # Log directly to wandb
+        global _global_step
+        
+        # Log directly to wandb (log() auto-increments global step)
         metrics = {
             f"train/task_{task_id}/loss": train_loss,
             f"train/task_{task_id}/accuracy": train_acc,
+            "task_id": task_id,
+            "epoch": epoch,
         }
         
-        # Use monotonic step counter: task_id * max_epochs + epoch
-        # This ensures steps are always increasing
-        global _max_epochs_per_task
-        step = task_id * _max_epochs_per_task + epoch
-        log(metrics, step=step)
+        current_step = _global_step
+        log(metrics)
         
         # Store locally for CSV export
         self.epoch_logs.append({
             'task_id': task_id,
             'epoch': epoch,
-            'step': step,
+            'step': current_step,
             'train_loss': train_loss,
             'train_accuracy': train_acc,
         })
@@ -287,16 +263,20 @@ class ExperimentLogger:
         train_acc: float
     ):
         """Log evaluation results - logs directly to wandb and stores locally."""
-        # Log to wandb using a separate step counter to avoid conflicts with training steps
-        global _eval_step
+        global _global_step
         
-        # Log to wandb: separate train and test accuracy as function of tasks trained
+        # Log accuracy and loss metrics (log() auto-increments global step)
         metrics = {
-            f"eval/task_{eval_task}/test_accuracy_vs_tasks_trained": eval_acc,
-            f"eval/task_{eval_task}/train_accuracy_vs_tasks_trained": train_acc,
+            f"accuracy_progression/task_{eval_task}_test": eval_acc,
+            f"accuracy_progression/task_{eval_task}_train": train_acc,
+            f"loss/task_{eval_task}_test": eval_loss,
+            f"loss/task_{eval_task}_train": train_loss,
+            "trained_task": trained_task,
+            "eval_task": eval_task,
         }
-        log(metrics, step=_eval_step)
-        _eval_step += 1
+        
+        current_step = _global_step
+        log(metrics)
         
         # Store results for plot generation (separate train/test)
         if eval_task not in self.results:
@@ -308,7 +288,7 @@ class ExperimentLogger:
         self.eval_logs.append({
             'trained_task': trained_task,
             'eval_task': eval_task,
-            'step': _eval_step - 1,
+            'step': current_step,
             'test_loss': eval_loss,
             'test_accuracy': eval_acc,
             'train_loss': train_loss,
@@ -355,9 +335,10 @@ class ExperimentLogger:
         self,
         fig: plt.Figure,
         name: str,
-        formats: List[str] = ['png', 'pdf']
+        formats: List[str] = ['png', 'pdf'],
+        upload_to_wandb: bool = True
     ):
-        """Save a matplotlib figure (both locally and to wandb)."""
+        """Save a matplotlib figure locally and optionally to wandb."""
         if not self.log_dir:
             return
         
@@ -365,8 +346,8 @@ class ExperimentLogger:
             path = self.log_dir / "plots" / f"{name}.{fmt}"
             fig.savefig(path, dpi=150, bbox_inches='tight')
             
-            # Log to wandb
-            if _wandb_run is not None and fmt == 'png':
+            # Log to wandb as image (only if requested)
+            if _wandb_run is not None and fmt == 'png' and upload_to_wandb:
                 wandb.log({f"plots/{name}": wandb.Image(fig)})
     
     def create_accuracy_plot(self, save: bool = True) -> plt.Figure:
@@ -391,7 +372,7 @@ class ExperimentLogger:
         fig.tight_layout()
         
         if save:
-            self.save_plot(fig, "accuracy_progression_test")
+            self.save_plot(fig, "accuracy_progression_test", upload_to_wandb=True)
         
         return fig
     
@@ -419,7 +400,7 @@ class ExperimentLogger:
         fig.tight_layout()
         
         if save:
-            self.save_plot(fig, "accuracy_progression_train")
+            self.save_plot(fig, "accuracy_progression_train", upload_to_wandb=True)
         
         return fig
     
@@ -452,7 +433,7 @@ class ExperimentLogger:
             fig.tight_layout()
         
         if save:
-            self.save_plot(fig, "forgetting_test")
+            self.save_plot(fig, "forgetting_test", upload_to_wandb=True)
         
         return fig
     
@@ -485,7 +466,7 @@ class ExperimentLogger:
             fig.tight_layout()
         
         if save:
-            self.save_plot(fig, "forgetting_train")
+            self.save_plot(fig, "forgetting_train", upload_to_wandb=True)
         
         return fig
     
@@ -516,13 +497,95 @@ class ExperimentLogger:
         
         return fig
     
+    def log_summary_metrics(self):
+        """Log summary metrics to wandb as raw data for interactive plots."""
+        if _wandb_run is None:
+            return
+        
+        num_tasks = len(self.results)
+        if num_tasks == 0:
+            return
+        
+        # Collect all summary metrics in one dict and log once
+        summary_metrics = {}
+        
+        # Compute forgetting metrics
+        test_forgetting_list = []
+        train_forgetting_list = []
+        
+        for t in range(num_tasks - 1):
+            if t in self.results:
+                # Test forgetting
+                test_accs = self.results[t].get('test', []) if isinstance(self.results[t], dict) else self.results[t]
+                if len(test_accs) > 1:
+                    test_forgetting = (max(test_accs) - test_accs[-1]) * 100
+                    test_forgetting_list.append(test_forgetting)
+                    summary_metrics[f"forgetting_bar/test_task_{t}"] = test_forgetting
+                
+                # Train forgetting
+                train_accs = self.results[t].get('train', []) if isinstance(self.results[t], dict) else []
+                if len(train_accs) > 1:
+                    train_forgetting = (max(train_accs) - train_accs[-1]) * 100
+                    train_forgetting_list.append(train_forgetting)
+                    summary_metrics[f"forgetting_bar/train_task_{t}"] = train_forgetting
+        
+        # Average forgetting metrics
+        if test_forgetting_list:
+            summary_metrics["summary/avg_test_forgetting"] = np.mean(test_forgetting_list)
+        if train_forgetting_list:
+            summary_metrics["summary/avg_train_forgetting"] = np.mean(train_forgetting_list)
+        
+        # Final accuracies for each task
+        final_test_accs = []
+        final_train_accs = []
+        for t in range(num_tasks):
+            if t in self.results:
+                test_accs = self.results[t].get('test', []) if isinstance(self.results[t], dict) else self.results[t]
+                train_accs = self.results[t].get('train', []) if isinstance(self.results[t], dict) else []
+                
+                if test_accs:
+                    summary_metrics[f"final_accuracy_bar/test_task_{t}"] = test_accs[-1]
+                    final_test_accs.append(test_accs[-1])
+                if train_accs:
+                    summary_metrics[f"final_accuracy_bar/train_task_{t}"] = train_accs[-1]
+                    final_train_accs.append(train_accs[-1])
+        
+        # Average final accuracies
+        if final_test_accs:
+            summary_metrics["summary/avg_final_test_accuracy"] = np.mean(final_test_accs)
+        if final_train_accs:
+            summary_metrics["summary/avg_final_train_accuracy"] = np.mean(final_train_accs)
+        
+        # Parameter drift summary if available
+        if hasattr(self, 'param_distances') and self.param_distances:
+            avg_l2 = np.mean([d['l2_distance'] for d in self.param_distances])
+            avg_fisher_train = np.mean([d['fisher_distance_train'] for d in self.param_distances])
+            avg_fisher_test = np.mean([d['fisher_distance_test'] for d in self.param_distances])
+            
+            summary_metrics["summary/avg_l2_distance"] = avg_l2
+            summary_metrics["summary/avg_fisher_distance_train"] = avg_fisher_train
+            summary_metrics["summary/avg_fisher_distance_test"] = avg_fisher_test
+        
+        # Log all summary metrics in one call (uses global step)
+        if summary_metrics:
+            log(summary_metrics)
+    
     def create_all_plots(self):
-        """Create and save all standard plots."""
+        """Create and save all standard plots locally and upload key plots to wandb."""
+        # Create and upload accuracy progression plots (line charts showing task accuracy over time)
         self.create_accuracy_plot(save=True)  # Test accuracy
         self.create_train_accuracy_plot(save=True)  # Train accuracy
+        
+        # Create and upload forgetting bar charts
         self.create_forgetting_plot(save=True)  # Test forgetting
         self.create_train_forgetting_plot(save=True)  # Train forgetting
+        
+        # Distribution drift plot
         self.create_distribution_drift_plot(save=True)
+        
+        # Log summary metrics to wandb
+        self.log_summary_metrics()
+        
         plt.close('all')
     
     def save(self):

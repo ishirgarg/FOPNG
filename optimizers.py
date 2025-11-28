@@ -31,15 +31,13 @@ class ContinualMethod(ABC):
         config: Config,
         task_id: int,
         multihead: bool = False,
-        collect_stats: bool = False,
         progress_desc: Optional[str] = None
-    ) -> Tuple[float, float, Optional[Dict[str, Any]]]:
+    ) -> Tuple[float, float]:
         """
         Train for one epoch.
         
         Returns:
-            Tuple of (loss, accuracy, optional_stats_dict)
-            Stats dict may contain: grad_norm_mean, grad_norm_std, update_norm_mean, update_norm_std
+            Tuple of (loss, accuracy)
         """
         pass
     
@@ -76,16 +74,12 @@ class SGDMethod(ContinualMethod):
         config: Config,
         task_id: int,
         multihead: bool = False,
-        collect_stats: bool = False,
         progress_desc: Optional[str] = None
-    ) -> Tuple[float, float, Optional[Dict[str, Any]]]:
+    ) -> Tuple[float, float]:
         model.train()
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
-        
-        grad_norms = []
-        update_norms = []
         
         iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
         
@@ -102,34 +96,14 @@ class SGDMethod(ContinualMethod):
             
             loss = criterion(logits, y)
             loss.backward()
-            
-            if collect_stats:
-                grad = get_grad_vector(model)
-                grad_norms.append(grad.norm().item())
-                
-                old_params = torch.cat([p.data.view(-1).clone() for p in model.parameters()])
-            
             optimizer.step()
-            
-            if collect_stats:
-                new_params = torch.cat([p.data.view(-1) for p in model.parameters()])
-                update_norms.append((new_params - old_params).norm().item())
             
             total_loss += loss.item() * x.size(0)
             preds = logits.argmax(dim=1)
             total_correct += (preds == y).sum().item()
             total_samples += x.size(0)
         
-        stats = None
-        if collect_stats and grad_norms:
-            stats = {
-                'grad_norm_mean': np.mean(grad_norms),
-                'grad_norm_std': np.std(grad_norms),
-                'update_norm_mean': np.mean(update_norms),
-                'update_norm_std': np.std(update_norms),
-            }
-        
-        return total_loss / total_samples, total_correct / total_samples, stats
+        return total_loss / total_samples, total_correct / total_samples
     
     def after_task(
         self,
@@ -168,17 +142,12 @@ class OGDMethod(ContinualMethod):
         config: Config,
         task_id: int,
         multihead: bool = False,
-        collect_stats: bool = False,
         progress_desc: Optional[str] = None
-    ) -> Tuple[float, float, Optional[Dict[str, Any]]]:
+    ) -> Tuple[float, float]:
         model.train()
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
-        
-        grad_norms = []
-        projected_grad_norms = []
-        update_norms = []
         
         iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
         
@@ -199,43 +168,17 @@ class OGDMethod(ContinualMethod):
             # Project gradient if we have stored directions
             if len(self.memory) > 0:
                 g = get_grad_vector(model)
-                if collect_stats:
-                    grad_norms.append(g.norm().item())
                 g_tilde = self.memory.project_orthogonal(g)
-                if collect_stats:
-                    projected_grad_norms.append(g_tilde.norm().item())
                 set_grad_vector(model, g_tilde)
-            elif collect_stats:
-                g = get_grad_vector(model)
-                grad_norms.append(g.norm().item())
-            
-            if collect_stats:
-                old_params = torch.cat([p.data.view(-1).clone() for p in model.parameters()])
             
             optimizer.step()
-            
-            if collect_stats:
-                new_params = torch.cat([p.data.view(-1) for p in model.parameters()])
-                update_norms.append((new_params - old_params).norm().item())
             
             total_loss += loss.item() * x.size(0)
             preds = logits.argmax(dim=1)
             total_correct += (preds == y).sum().item()
             total_samples += x.size(0)
         
-        stats = None
-        if collect_stats and grad_norms:
-            stats = {
-                'grad_norm_mean': np.mean(grad_norms),
-                'grad_norm_std': np.std(grad_norms),
-                'update_norm_mean': np.mean(update_norms),
-                'update_norm_std': np.std(update_norms),
-            }
-            if projected_grad_norms:
-                stats['projected_grad_norm_mean'] = np.mean(projected_grad_norms)
-                stats['projected_grad_norm_std'] = np.std(projected_grad_norms)
-        
-        return total_loss / total_samples, total_correct / total_samples, stats
+        return total_loss / total_samples, total_correct / total_samples
     
     def after_task(
         self,
@@ -279,7 +222,6 @@ class FOPNGMethod(ContinualMethod):
         self.memory.clear()
         self.F_old = None
         self.lambda_reg = config.fopng_lambda_reg
-        self.epsilon = config.fopng_epsilon
 
     def _compute_update_prep(
         self,
@@ -310,7 +252,8 @@ class FOPNGMethod(ContinualMethod):
         F_new: torch.Tensor,
         F_old: torch.Tensor,
         G: torch.Tensor,
-        device: str
+        device: str,
+        lr: float
     ) -> torch.Tensor:
         """Compute FOPNG update step."""
         lam = self.lambda_reg
@@ -324,7 +267,7 @@ class FOPNGMethod(ContinualMethod):
             P_g = gradient - correction
             F_new_inv_P_g = P_g * F_new_inv_diag
             denom = torch.sqrt((P_g * F_new_inv_P_g).sum() + 1e-8)
-            v_star = -self.epsilon * F_new_inv_P_g / (denom + 1e-8)
+            v_star = -lr * F_new_inv_P_g / (denom + 1e-8)
         else:
             # Full Fisher
             F_new_inv = torch.inverse(F_new + lam * torch.eye(F_new.size(0), device=device))
@@ -335,7 +278,7 @@ class FOPNGMethod(ContinualMethod):
             P_g = P @ gradient
             F_new_inv_P_g = F_new_inv @ P_g
             denom = torch.sqrt(P_g @ F_new_inv_P_g + 1e-8)
-            v_star = -self.epsilon * F_new_inv_P_g / denom
+            v_star = -lr * F_new_inv_P_g / denom
         
         return v_star
     
@@ -348,36 +291,27 @@ class FOPNGMethod(ContinualMethod):
         config: Config,
         task_id: int,
         multihead: bool = False,
-        collect_stats: bool = False,
         progress_desc: Optional[str] = None
-    ) -> Tuple[float, float, Optional[Dict[str, Any]]]:
+    ) -> Tuple[float, float]:
         
         # For first task or if no stored gradients, use regular training
         G = self.memory.get_matrix()
         if task_id == 0 or G is None:
             return self._train_regular(
                 model, optimizer, train_loader, criterion, config,
-                task_id, multihead, collect_stats, progress_desc
+                task_id, multihead, progress_desc
             )
         
         # Compute Fisher matrices
-        
         F_new = self.fisher_estimator.estimate(model, train_loader, criterion, config.device)
         
         if self.F_old is None:
             self.F_old = F_new.clone()
-
-        # EXTRA CODE
-        # self.F_old = F_new.clone()
-        ##
         
         model.train()
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
-        
-        grad_norms = []
-        update_norms = []
         
         self._compute_update_prep(F_new, self.F_old, G, config.device)
         iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
@@ -396,13 +330,7 @@ class FOPNGMethod(ContinualMethod):
             loss.backward()
             
             grad = get_grad_vector(model)
-            if collect_stats:
-                grad_norms.append(grad.norm().item())
-            
-            update = self._compute_update(grad, F_new, self.F_old, G, config.device)
-            if collect_stats:
-                update_norms.append(update.norm().item())
-            
+            update = self._compute_update(grad, F_new, self.F_old, G, config.device, config.lr)
             apply_update(model, update)
             
             total_loss += loss.item() * x.size(0)
@@ -410,16 +338,7 @@ class FOPNGMethod(ContinualMethod):
             total_correct += (preds == y).sum().item()
             total_samples += x.size(0)
         
-        stats = None
-        if collect_stats and grad_norms:
-            stats = {
-                'grad_norm_mean': np.mean(grad_norms),
-                'grad_norm_std': np.std(grad_norms),
-                'update_norm_mean': np.mean(update_norms),
-                'update_norm_std': np.std(update_norms),
-            }
-        
-        return total_loss / total_samples, total_correct / total_samples, stats
+        return total_loss / total_samples, total_correct / total_samples
     
     def _train_regular(
         self,
@@ -430,17 +349,13 @@ class FOPNGMethod(ContinualMethod):
         config: Config,
         task_id: int,
         multihead: bool = False,
-        collect_stats: bool = False,
         progress_desc: Optional[str] = None
-    ) -> Tuple[float, float, Optional[Dict[str, Any]]]:
+    ) -> Tuple[float, float]:
         """Regular Adam training for first task."""
         model.train()
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
-        
-        grad_norms = []
-        update_norms = []
         
         iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
         
@@ -457,33 +372,14 @@ class FOPNGMethod(ContinualMethod):
             
             loss = criterion(logits, y)
             loss.backward()
-            
-            if collect_stats:
-                grad = get_grad_vector(model)
-                grad_norms.append(grad.norm().item())
-                old_params = torch.cat([p.data.view(-1).clone() for p in model.parameters()])
-            
             optimizer.step()
-            
-            if collect_stats:
-                new_params = torch.cat([p.data.view(-1) for p in model.parameters()])
-                update_norms.append((new_params - old_params).norm().item())
             
             total_loss += loss.item() * x.size(0)
             preds = logits.argmax(dim=1)
             total_correct += (preds == y).sum().item()
             total_samples += x.size(0)
         
-        stats = None
-        if collect_stats and grad_norms:
-            stats = {
-                'grad_norm_mean': np.mean(grad_norms),
-                'grad_norm_std': np.std(grad_norms),
-                'update_norm_mean': np.mean(update_norms),
-                'update_norm_std': np.std(update_norms),
-            }
-        
-        return total_loss / total_samples, total_correct / total_samples, stats
+        return total_loss / total_samples, total_correct / total_samples
     
     def after_task(
         self,

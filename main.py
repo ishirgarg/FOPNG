@@ -84,8 +84,6 @@ def run_experiment(
     if logger:
         logger.start_experiment(method.name, dataset_name, task_names)
     
-    collect_stats = config.save_raw_data if hasattr(config, 'save_raw_data') else False
-    
     prev_params = None
     param_distances = []
     for t in range(num_tasks):
@@ -97,7 +95,7 @@ def run_experiment(
         train_loader, _ = tasks[t]
         
         for epoch in range(config.epochs_per_task):
-            result = method.train_epoch(
+            loss, acc = method.train_epoch(
                 model,
                 optimizer,
                 train_loader,
@@ -105,11 +103,8 @@ def run_experiment(
                 config,
                 t,
                 multihead,
-                collect_stats,
                 progress_desc=f"Task {t} Epoch {epoch+1}/{config.epochs_per_task}"
             )
-            loss, acc = result[0], result[1]
-            stats = result[2] if len(result) > 2 else None
             
             print(f"Epoch {epoch+1}/{config.epochs_per_task} | "
                   f"Loss: {loss:.4f} | Acc: {acc*100:.2f}%")
@@ -119,12 +114,7 @@ def run_experiment(
                     task_id=t,
                     epoch=epoch + 1,
                     train_loss=loss,
-                    train_acc=acc,
-                    grad_norm_mean=None,  # No longer logging grad norms
-                    grad_norm_std=None,
-                    update_norm_mean=None,
-                    update_norm_std=None,
-                    extra_stats=None  # Don't log extra stats either
+                    train_acc=acc
                 )
 
         # Compute empirical Fisher
@@ -149,16 +139,14 @@ def run_experiment(
             })
             print(f"  Parameter drift: L2={l2_dist:.4f}, Fisher(train)={fisher_dist_train:.4f}, Fisher(test)={fisher_dist_test:.4f}")
             
-            # Log parameter distances to wandb
-            from logger import log, _max_epochs_per_task
-            # Use same step calculation as eval - step of last epoch of task t
-            step = t * _max_epochs_per_task + config.epochs_per_task
+            # Log parameter distances to wandb (uses global step counter)
+            from logger import log
             log({
                 "param_drift/l2_distance": l2_dist,
                 "param_drift/fisher_distance_train": fisher_dist_train,
                 "param_drift/fisher_distance_test": fisher_dist_test,
-                "task": t,
-            }, step=step)
+                "trained_task": t,  # x-axis: which task we just finished training
+            })
             
         prev_params = current_params.clone()
         
@@ -474,7 +462,6 @@ def make_exp_name(args):
         parts.append(args.collector)
         parts.append(f"{args.max_directions}dirs")
         parts.append(f"lam{args.fopng_lambda_reg}")
-        parts.append(f"eps{args.fopng_epsilon}")
     elif args.method == "ogd":
         parts.append(args.collector)
         parts.append(f"{args.max_directions}dirs")
@@ -540,8 +527,6 @@ def main():
     # FOPNG-specific
     parser.add_argument("--fopng_lambda_reg", type=float, default=0.0,
                         help="Regularization parameter for FOPNG")
-    parser.add_argument("--fopng_epsilon", type=float, default=0.0,
-                        help="Epsilon parameter for FOPNG")
 
     # --------------------------------
     # Logging / saving
@@ -592,7 +577,6 @@ def main():
 
         # FOPNG specific
         fopng_lambda_reg=args.fopng_lambda_reg,
-        fopng_epsilon=args.fopng_epsilon,
     )
 
     # --------------------------------------------------------------------

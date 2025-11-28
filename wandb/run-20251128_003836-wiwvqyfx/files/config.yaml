@@ -1,0 +1,90 @@
+_wandb:
+    value:
+        cli_version: 0.23.0
+        e:
+            eqexojskdjvxmefjxudfqis3vheuorti:
+                apple:
+                    ecpuCores: 4
+                    gpuCores: 16
+                    memoryGb: 32
+                    name: Apple M2 Pro
+                    pcpuCores: 6
+                    ramTotalBytes: "34359738368"
+                    swapTotalBytes: "46170898432"
+                args:
+                    - --dataset
+                    - rotated_mnist
+                    - --method
+                    - sgd
+                    - --num_tasks
+                    - "5"
+                    - --epochs
+                    - "5"
+                    - --lr
+                    - "1e-3"
+                    - --batch_size
+                    - "10"
+                    - --seed
+                    - "5"
+                    - --device
+                    - mps
+                codePath: main.py
+                codePathLocal: main.py
+                cpu_count: 10
+                cpu_count_logical: 10
+                disk:
+                    /:
+                        total: "994662584320"
+                        used: "834205904896"
+                email: ishirgarg@berkeley.edu
+                executable: /Users/ishirgarg/Github/FOPNG/.venv/bin/python3
+                git:
+                    commit: 80edfadac5f2011909777b15304f6242a9b8f0d0
+                    remote: https://github.com/ishirgarg/FOPNG
+                host: ishirs-mbp.lan
+                memory:
+                    total: "34359738368"
+                os: macOS-14.4.1-arm64-arm-64bit-Mach-O
+                program: /Users/ishirgarg/Github/FOPNG/main.py
+                python: CPython 3.13.3
+                root: /Users/ishirgarg/Github/FOPNG
+                startedAt: "2025-11-28T08:38:36.671047Z"
+                writerId: eqexojskdjvxmefjxudfqis3vheuorti
+        m: []
+        python_version: 3.13.3
+        t:
+            "1":
+                - 1
+                - 41
+                - 51
+            "2":
+                - 1
+                - 41
+                - 51
+            "3":
+                - 3
+                - 13
+                - 16
+                - 61
+            "4": 3.13.3
+            "5": 0.23.0
+            "12": 0.23.0
+            "13": darwin-arm64
+batch_size:
+    value: 10
+device:
+    value: mps
+epochs_per_task:
+    value: 5
+experiment_name:
+    value: rotated_mnist_sgd_angles_0-10-20-30-40_5epochs_20251128_003836
+fopng_epsilon:
+    value: 0
+fopng_lambda_reg:
+    value: 0
+grads_per_task:
+    value: 200
+lr:
+    value: 0.001
+seed:
+    value: 5
