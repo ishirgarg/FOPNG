@@ -300,7 +300,7 @@ class FOPNGMethod(ContinualMethod):
                 if (i+1) % 50 == 0:
                     print(f"  [KFAC]   Column {i+1}/{G.shape[1]}...")
                 
-                g_col_dict = self._split_gradient_to_layers(G[:, i])
+                g_col_dict, g_col_original = self._split_gradient_to_layers(G[:, i])
                 
                 # F_old @ g_col
                 self.fisher_estimator.fisher_factors = F_old
@@ -314,7 +314,7 @@ class FOPNGMethod(ContinualMethod):
                 self.fisher_estimator.fisher_factors = F_old
                 temp3 = self.fisher_estimator.apply_fisher(temp2)
                 
-                A_components.append(self._flatten_gradients(temp3))
+                A_components.append(self._flatten_gradients(temp3, g_col_original))
             
             weighted_G = torch.stack(A_components, dim=1)
             A = G.T @ weighted_G + lam * torch.eye(G.size(1), device=device)
@@ -357,8 +357,13 @@ class FOPNGMethod(ContinualMethod):
             raise NotImplementedError("Precomputation for full Fisher not implemented.")
 
     
-    def _split_gradient_to_layers(self, grad_vector: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Convert flat gradient vector to {layer_name: weight_matrix}."""
+    def _split_gradient_to_layers(self, grad_vector: torch.Tensor) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        """
+        Convert flat gradient vector to {layer_name: weight_matrix} and separate bias gradient.
+        
+        Returns:
+            Tuple of (weight_grad_dict, full_grad_vector) where full_grad_vector is the original input
+        """
         grad_dict = {}
         idx = 0
         for name, param in self.model.named_parameters():
@@ -371,23 +376,52 @@ class FOPNGMethod(ContinualMethod):
                 # Non-linear layers, skip for now
                 n = param.numel()
                 idx += n
-        return grad_dict
+            else:
+                # Bias and other params
+                n = param.numel()
+                idx += n
+        
+        return grad_dict, grad_vector  # Return original gradient too
     
-    def _flatten_gradients(self, grad_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Convert {layer_name: weight_matrix} to flat vector including all parameters."""
-        # Build full gradient vector including biases and non-KFAC parameters
+    def _flatten_gradients(self, grad_dict: Dict[str, torch.Tensor], original_grad: torch.Tensor) -> torch.Tensor:
+        """
+        Convert {layer_name: weight_matrix} back to flat vector, preserving non-weight gradients.
+        
+        Args:
+            grad_dict: Dict of preconditioned weight gradients
+            original_grad: Original full gradient vector (for bias terms)
+        """
         full_grad = []
+        idx = 0
+        total_bias_norm = 0.0
+        total_weight_norm = 0.0
+        
         for name, param in self.model.named_parameters():
+            n = param.numel()
+            
             if 'weight' in name:
                 layer_name = name.replace('.weight', '')
                 if layer_name in grad_dict:
-                    full_grad.append(grad_dict[layer_name].view(-1))
+                    # Use preconditioned weight gradient
+                    weight_grad = grad_dict[layer_name].view(-1)
+                    full_grad.append(weight_grad)
+                    total_weight_norm += weight_grad.norm().item() ** 2
                 else:
-                    # For non-KFAC layers, use zeros (shouldn't happen but safe)
-                    full_grad.append(torch.zeros_like(param.view(-1)))
+                    # For non-KFAC layers, use original gradient
+                    weight_grad = original_grad[idx:idx+n]
+                    full_grad.append(weight_grad)
+                    total_weight_norm += weight_grad.norm().item() ** 2
             else:
-                # Biases and other parameters - set to zero (KFAC doesn't precondition these)
-                full_grad.append(torch.zeros_like(param.view(-1)))
+                # For biases: use original gradient (not preconditioned by KFAC)
+                bias_grad = original_grad[idx:idx+n]
+                full_grad.append(bias_grad)
+                total_bias_norm += bias_grad.norm().item() ** 2
+            
+            idx += n
+        
+        # import numpy as np
+        # print(f"[DEBUG _flatten] Weight grad norm: {np.sqrt(total_weight_norm):.6f}")
+        # print(f"[DEBUG _flatten] Bias grad norm: {np.sqrt(total_bias_norm):.6f}  ← Should NOT be zero!")
         
         return torch.cat(full_grad)
     
@@ -421,13 +455,23 @@ class FOPNGMethod(ContinualMethod):
 
         if self.is_kfac:
             # KFAC-based FOPNG: Same structure as diagonal, but using KFAC operations
-            grad_dict = self._split_gradient_to_layers(gradient)
+            # Split into weight dict and keep original for biases
+            grad_dict, original_grad = self._split_gradient_to_layers(gradient)
             saved_factors = self.fisher_estimator.fisher_factors
+            
+            # DEBUG 1: Check input gradient
+            # print(f"\n[DEBUG] Input gradient norm: {gradient.norm().item():.6f}")
+            # print(f"[DEBUG] Input gradient has NaN: {torch.isnan(gradient).any()}")
+            # print(f"[DEBUG] Input gradient has Inf: {torch.isinf(gradient).any()}")
             
             # Step 1: F_old @ gradient
             self.fisher_estimator.fisher_factors = F_old
             F_old_g_dict = self.fisher_estimator.apply_fisher(grad_dict)
-            F_old_g = self._flatten_gradients(F_old_g_dict)
+            F_old_g = self._flatten_gradients(F_old_g_dict, original_grad)  # Pass original
+            
+            # DEBUG 2: After F_old application
+            # print(f"[DEBUG] After F_old: norm = {F_old_g.norm().item():.6f}")
+            # print(f"[DEBUG] After F_old: has NaN = {torch.isnan(F_old_g).any()}")
             
             # Step 2: G^T @ F_old @ gradient
             G_T_F_old_g = G.T @ F_old_g
@@ -438,19 +482,34 @@ class FOPNGMethod(ContinualMethod):
             # Step 4: Project: correction = F_old @ G @ A^{-1} @ G^T @ F_old @ g
             correction_vec = G @ A_inv_G_T_F_old_g
             correction_unweighted = correction_vec.clone()  # Save for diagnostics
-            correction_dict = self._split_gradient_to_layers(correction_vec)
+            correction_dict, _ = self._split_gradient_to_layers(correction_vec)  # Take just the dict
             correction_dict_applied = self.fisher_estimator.apply_fisher(correction_dict)
-            correction = self._flatten_gradients(correction_dict_applied)
+            correction = self._flatten_gradients(correction_dict_applied, original_grad)  # Pass original
+            
+            # DEBUG 3: Correction
+            # print(f"[DEBUG] Correction norm: {correction.norm().item():.6f}")
+            # print(f"[DEBUG] Correction has NaN: {torch.isnan(correction).any()}")
+            
             P_g = gradient - correction
             
+            # DEBUG 4: Projected gradient
+            # print(f"[DEBUG] Projected grad norm: {P_g.norm().item():.6f}")
+            # print(f"[DEBUG] Projection ratio: {P_g.norm().item() / (gradient.norm().item() + 1e-10):.4f}")
+            
             # Step 5: Apply F_new^{-1} to projected gradient
-            P_g_dict = self._split_gradient_to_layers(P_g)
+            P_g_dict, _ = self._split_gradient_to_layers(P_g)  # Take just the dict
             self.fisher_estimator.fisher_factors = F_new
             F_new_inv_P_g_dict = self.fisher_estimator.apply_inverse(P_g_dict, lam)
-            F_new_inv_P_g = self._flatten_gradients(F_new_inv_P_g_dict)
+            F_new_inv_P_g = self._flatten_gradients(F_new_inv_P_g_dict, original_grad)  # Pass original
+            
+            # DEBUG 5: After preconditioning
+            # print(f"[DEBUG] After F_new^-1: norm = {F_new_inv_P_g.norm().item():.6f}")
+            # print(f"[DEBUG] After F_new^-1: has NaN: {torch.isnan(F_new_inv_P_g).any()}")
             
             # Step 6: Normalize (use lr like diagonal does)
             denom = torch.sqrt((P_g * F_new_inv_P_g).sum() + 1e-8)
+            # print(f"[DEBUG] Denominator: {denom.item():.6f}")
+            
             # Check for NaN/inf to prevent numerical instability
             if torch.isnan(denom) or torch.isinf(denom) or denom <= 0:
                 # Fallback: use raw gradient if normalization fails
@@ -462,6 +521,11 @@ class FOPNGMethod(ContinualMethod):
             if torch.isnan(v_star).any() or torch.isinf(v_star).any():
                 # Fallback: use raw gradient scaled by learning rate
                 v_star = -lr * gradient / (gradient.norm() + 1e-8)
+            
+            # DEBUG 6: Final update
+            # print(f"[DEBUG] Final update norm: {v_star.norm().item():.6f}")
+            # print(f"[DEBUG] Final update has NaN: {torch.isnan(v_star).any()}")
+            # print(f"[DEBUG] Update-to-grad ratio: {v_star.norm().item() / (gradient.norm().item() + 1e-10):.4f}")
             
             if return_intermediate:
                 # --- DIAGNOSTICS FOR CORRECTION (matching diagonal) ---

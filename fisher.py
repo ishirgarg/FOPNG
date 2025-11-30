@@ -556,6 +556,13 @@ class KFACFisherEstimator(FisherEstimator):
             A_damped = A + pi * sqrt_damping * torch.eye(A.size(0), device=A.device)
             G_damped = G + (1/pi) * sqrt_damping * torch.eye(G.size(0), device=G.device)
             
+            # Check condition numbers
+            A_cond = torch.linalg.cond(A_damped).item()
+            G_cond = torch.linalg.cond(G_damped).item()
+            print(f"[{name}] A condition: {A_cond:.2e}, G condition: {G_cond:.2e}")
+            if A_cond > 1e6 or G_cond > 1e6:
+                print(f"  WARNING: Poorly conditioned matrices!")
+            
             # Invert (use Cholesky for stability)
             try:
                 A_chol = torch.linalg.cholesky(A_damped)
@@ -652,6 +659,13 @@ class KFACFisherEstimator(FisherEstimator):
             # Ã = Ā + π√λ I,  G̃ = G + (1/π)√λ I
             A_damped = A + pi * sqrt_damping * torch.eye(A.size(0), device=A.device)
             G_damped = G + (1/pi) * sqrt_damping * torch.eye(G.size(0), device=G.device)
+            
+            # Check condition numbers
+            A_cond = torch.linalg.cond(A_damped).item()
+            G_cond = torch.linalg.cond(G_damped).item()
+            print(f"[{name}] A condition: {A_cond:.2e}, G condition: {G_cond:.2e}")
+            if A_cond > 1e6 or G_cond > 1e6:
+                print(f"  WARNING: Poorly conditioned matrices!")
             
             # Invert (use Cholesky for stability)
             try:
