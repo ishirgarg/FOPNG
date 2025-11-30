@@ -214,162 +214,147 @@ class KFACFisherEstimator(FisherEstimator):
         max_samples: int = 1000
     ) -> dict:
         """
-        Compute A and G factors for each layer.
+        Compute A and G factors using explicit gradient computation.
         
         Args:
             max_samples: Maximum number of samples to use (default 1000).
                         Use fewer samples for speed vs. full dataset for accuracy.
         """
         print(f"[KFAC] Starting Fisher estimation (max {max_samples} samples)...")
-        activations = {}
-        # Per-sample gradient accumulator (will accumulate g_i g_i^T for each sample)
-        per_sample_grad_accum = {}
         
-        # ============================================================
-        # HOOKS: Capture ā (forward) and g (backward)
-        # ============================================================
-        def save_activation(name):
-            def hook(module, input, output):
-                act = input[0].detach().view(input[0].size(0), -1)
-                # Add bias term: ā = [a; 1]
-                ones = torch.ones(act.size(0), 1, device=act.device)
-                activations[name] = torch.cat([act, ones], dim=1)
-            return hook
+        # Storage
+        A_sum = {}
+        G_sum = {}
+        n_samples = 0
         
-        # Register forward hooks on Linear layers (backward hooks registered per-batch for per-sample gradients)
-        handles = []
+        # Identify Linear layers
         layer_names = []
+        layer_modules = {}
         for name, module in model.named_modules():
             if isinstance(module, nn.Linear):
-                handles.append(module.register_forward_hook(save_activation(name)))
                 layer_names.append(name)
+                layer_modules[name] = module
+                A_sum[name] = None
+                G_sum[name] = None
                 self.fisher_factors[name] = {'A': None, 'G': None}
         
-        # Use train mode to ensure hooks fire properly
+        if not layer_names:
+            print(f"[KFAC] Warning: No Linear layers found in model!")
+            print(f"[KFAC] Model structure: {[n for n, m in model.named_modules()]}")
+            return self.fisher_factors
+        
+        print(f"[KFAC] Registered layers: {layer_names}")
+        
         was_training = model.training
         model.train()
         
-        # ============================================================
-        # ACCUMULATE: Compute E[ā ā^T] and E[g g^T]
-        # ============================================================
-        A_sum = {name: None for name in layer_names}
-        G_sum = {name: None for name in layer_names}
-        n_samples = 0
-        
-        batch_count = 0
+        batch_idx = 0
         for data, target in dataloader:
-            batch_count += 1
-            if batch_count % 50 == 0:
-                print(f"[KFAC] Batch {batch_count}, samples: {n_samples}...")
+            if n_samples >= max_samples:
+                break
+                
             data, target = data.to(device), target.to(device)
             batch_size = data.size(0)
             
-            # Early exit if we've collected enough samples
-            if n_samples >= max_samples:
-                print(f"[KFAC] Reached max_samples ({max_samples}), stopping early")
-                break
-            
-            # Forward pass (handle multihead models)
-            if task_id is not None:
-                output = model(data, task_id=task_id)
-            else:
-                output = model(data)
-            
-            # Sample from model distribution (Section 5 of paper)
-            with torch.no_grad():
-                if isinstance(criterion, nn.CrossEntropyLoss):
-                    probs = torch.softmax(output, dim=1)
-                    sampled_targets = torch.multinomial(probs, 1).squeeze()
-                else:
-                    sampled_targets = output.detach()
-            
-            # Compute per-sample losses and gradients (exact Fisher formula)
-            # Use reduction='none' to get per-sample losses, then backward each separately
-            if isinstance(criterion, nn.CrossEntropyLoss):
-                # Create a criterion with no reduction for per-sample losses
-                per_sample_criterion = nn.CrossEntropyLoss(reduction='none')
-                per_sample_losses = per_sample_criterion(output, sampled_targets)
-            else:
-                # For other criteria, assume they support reduction='none'
-                per_sample_losses = criterion(output, sampled_targets)
-                if per_sample_losses.dim() > 0:
-                    # Already per-sample
-                    pass
-                else:
-                    # Scalar loss - need to handle differently
-                    per_sample_losses = per_sample_losses.unsqueeze(0).expand(batch_size)
-            
-            # Clear per-sample gradient accumulator for this batch
-            per_sample_grad_accum.clear()
-            
-            # Register backward hooks for per-sample gradients
-            grad_handles = []
-            for name, module in model.named_modules():
-                if isinstance(module, nn.Linear) and name in layer_names:
-                    # Register a hook that will accumulate per-sample gradients
-                    def make_grad_hook(layer_name):
-                        def hook(module, grad_input, grad_output):
-                            # grad_output[0] = ∂L/∂s (pre-activation gradient)
-                            g = grad_output[0].detach().view(grad_output[0].size(0), -1)
-                            # For per-sample backward, g should be shape (1, out_dim) or (batch_size, out_dim)
-                            # We'll accumulate g_i g_i^T for each sample
-                            if g.size(0) == 1:
-                                # Single sample backward
-                                g_i = g[0:1]  # (1, out_dim)
-                                if layer_name not in per_sample_grad_accum:
-                                    per_sample_grad_accum[layer_name] = g_i.t() @ g_i
-                                else:
-                                    per_sample_grad_accum[layer_name] = per_sample_grad_accum[layer_name] + g_i.t() @ g_i
-                            else:
-                                # Batch backward - this shouldn't happen with per-sample, but handle it
-                                for i in range(g.size(0)):
-                                    g_i = g[i:i+1]  # (1, out_dim)
-                                    if layer_name not in per_sample_grad_accum:
-                                        per_sample_grad_accum[layer_name] = g_i.t() @ g_i
-                                    else:
-                                        per_sample_grad_accum[layer_name] = per_sample_grad_accum[layer_name] + g_i.t() @ g_i
-                        return hook
-                    grad_handles.append(module.register_full_backward_hook(make_grad_hook(name)))
-            
-            # Accumulate outer products per-sample: A = Σ_i ā_i ā_i^T, G = Σ_i g_i g_i^T
+            # Process each sample individually
             for i in range(batch_size):
+                if n_samples >= max_samples:
+                    break
+                
+                # Single sample
+                x_i = data[i:i+1]
+                
+                # === SINGLE FORWARD PASS: Capture both activations and outputs ===
+                activations = {}
+                layer_outputs = {}
+                
+                def save_activation(name):
+                    def hook(module, input, output):
+                        # Save input to layer (this is 'a' in the paper)
+                        # Don't detach - we need it in the computation graph for gradient computation
+                        act = input[0].view(-1)  # Flatten, keep in graph
+                        # Add bias term
+                        act_with_bias = torch.cat([act, torch.ones(1, device=act.device, requires_grad=False)])
+                        activations[name] = act_with_bias
+                    return hook
+                
+                def save_output(name):
+                    def hook(module, input, output):
+                        # Save layer output (pre-activation for Linear layers)
+                        layer_outputs[name] = output
+                    return hook
+                
+                # Register both hooks
+                handles = []
+                for name in layer_names:
+                    handles.append(layer_modules[name].register_forward_hook(save_activation(name)))
+                    handles.append(layer_modules[name].register_forward_hook(save_output(name)))
+                
+                # Single forward pass
                 model.zero_grad()
-                # Backward for single sample
-                per_sample_losses[i].backward(retain_graph=(i < batch_size - 1))
-            
-            # Remove gradient hooks
-            for handle in grad_handles:
-                handle.remove()
-            
-            # Accumulate activations (per-sample): A = Σ_i ā_i ā_i^T
-            for name in layer_names:
-                if name in activations:
-                    act = activations[name]  # (batch_size, in_dim+1)
-                    # Accumulate per-sample: Σ_i act_i act_i^T
-                    if A_sum[name] is None:
-                        A_sum[name] = act.t() @ act  # This correctly computes Σ_i act_i act_i^T
+                if task_id is not None:
+                    output = model(x_i, task_id=task_id)
+                else:
+                    output = model(x_i)
+                
+                # Sample from model distribution
+                with torch.no_grad():
+                    if isinstance(criterion, nn.CrossEntropyLoss):
+                        probs = torch.softmax(output, dim=1)
+                        sampled_target = torch.multinomial(probs, 1).squeeze(1)  # Remove last dim: [1,1] -> [1]
                     else:
-                        A_sum[name] = A_sum[name] + act.t() @ act
-            
-            # Accumulate gradients (already accumulated in hooks): G = Σ_i g_i g_i^T
-            for name in layer_names:
-                if name in per_sample_grad_accum:
-                    if G_sum[name] is None:
-                        G_sum[name] = per_sample_grad_accum[name]
-                    else:
-                        G_sum[name] = G_sum[name] + per_sample_grad_accum[name]
-            
-            n_samples += batch_size
-            activations.clear()
-            per_sample_grad_accum.clear()
+                        sampled_target = output.detach()
+                
+                # Compute loss
+                loss = criterion(output, sampled_target)
+                
+                # Compute gradients of loss w.r.t. each layer output
+                for name in layer_names:
+                    if name in layer_outputs and name in activations:
+                        layer_out = layer_outputs[name]
+                        
+                        # Compute ∂L/∂layer_out
+                        grad_out = torch.autograd.grad(
+                            outputs=loss,
+                            inputs=layer_out,
+                            retain_graph=True,
+                            create_graph=False,
+                            only_inputs=True
+                        )[0]
+                        
+                        # g_i = ∂L/∂s (gradient w.r.t. layer output)
+                        g_i = grad_out.detach().view(-1)  # Shape: (out_dim,)
+                        
+                        # a_i = input with bias (detach for accumulation)
+                        a_i = activations[name].detach()  # Shape: (in_dim + 1,)
+                        
+                        # Accumulate A = Σ a_i a_i^T
+                        A_sample = torch.outer(a_i, a_i)
+                        if A_sum[name] is None:
+                            A_sum[name] = A_sample
+                        else:
+                            A_sum[name] += A_sample
+                        
+                        # Accumulate G = Σ g_i g_i^T
+                        G_sample = torch.outer(g_i, g_i)
+                        if G_sum[name] is None:
+                            G_sum[name] = G_sample
+                        else:
+                            G_sum[name] += G_sample
+                
+                # Cleanup
+                for handle in handles:
+                    handle.remove()
+                
+                n_samples += 1
+                
+            batch_idx += 1
+            if batch_idx % 50 == 0:
+                print(f"[KFAC] Batch {batch_idx}, samples: {n_samples}...")
         
-        # Cleanup and normalize
-        for handle in handles:
-            handle.remove()
-        
-        # Restore original training state
         model.train(was_training)
         
+        # Normalize and store
         for name in layer_names:
             if A_sum[name] is not None and G_sum[name] is not None:
                 A_new = A_sum[name] / n_samples
@@ -388,17 +373,14 @@ class KFACFisherEstimator(FisherEstimator):
                     )
                 else:
                     # First time or not using running average: initialize
-                    self.fisher_factors[name]['A'] = A_new
-                    self.fisher_factors[name]['G'] = G_new
+                    self.fisher_factors[name] = {'A': A_new, 'G': G_new}
             else:
-                # Hooks didn't capture (e.g., unused heads in multihead models)
-                # Skip this layer - don't add to fisher_factors
-                print(f"[KFAC] Warning: No activations captured for layer {name}")
+                print(f"[KFAC] Warning: No data for layer {name}")
                 if name in self.fisher_factors:
                     del self.fisher_factors[name]
         
         self.step_count += 1
-        self.inverses_valid = False  # Invalidate cached inverses
+        self.inverses_valid = False
         avg_type = "moving average" if self.use_running_avg else "batch estimate"
         print(f"[KFAC] Fisher estimation complete ({len(self.fisher_factors)} layers, {avg_type})")
         return self.fisher_factors
@@ -534,7 +516,6 @@ class KFACFisherEstimator(FisherEstimator):
         Explicitly recompute and cache inverse factors.
         Should be called after A and G have been updated significantly.
         """
-        print(f"[KFAC] Recomputing inverses (step {self.step_count})...")
         self.cached_inverses = self._compute_inverses(damping)
         self.inverses_valid = True
         self.last_inversion_step = self.step_count
@@ -549,6 +530,103 @@ class KFACFisherEstimator(FisherEstimator):
         if not self.inverses_valid or not self.cached_inverses:
             self.recompute_inverses(damping)
         return self.cached_inverses
+    
+    def _compute_inverses(self, damping=1e-3):
+        """Internal method to compute Ā^{-1} and G^{-1} with Tikhonov damping."""
+        inverse_factors = {}
+        sqrt_damping = torch.sqrt(torch.tensor(damping))
+        
+        for name, factors in self.fisher_factors.items():
+            A, G = factors['A'], factors['G']
+            
+            # Move to CPU for linear algebra operations if on MPS (better compatibility)
+            device = A.device
+            use_cpu = str(device).startswith('mps')
+            
+            if use_cpu:
+                A = A.cpu()
+                G = G.cpu()
+            
+            # Factored damping (Section 6.3)
+            # π_i = √(tr(Ā)/dim(Ā) / tr(G)/dim(G))
+            pi = torch.sqrt((torch.trace(A) / A.size(0)) / 
+                           (torch.trace(G) / G.size(0) + 1e-8))
+            
+            # Ã = Ā + π√λ I,  G̃ = G + (1/π)√λ I
+            A_damped = A + pi * sqrt_damping * torch.eye(A.size(0), device=A.device)
+            G_damped = G + (1/pi) * sqrt_damping * torch.eye(G.size(0), device=G.device)
+            
+            # Invert (use Cholesky for stability)
+            try:
+                A_chol = torch.linalg.cholesky(A_damped)
+                A_inv = torch.cholesky_inverse(A_chol)
+                
+                G_chol = torch.linalg.cholesky(G_damped)
+                G_inv = torch.cholesky_inverse(G_chol)
+            except Exception as e:
+                A_inv = torch.linalg.inv(A_damped)
+                G_inv = torch.linalg.inv(G_damped)
+            
+            # Move back to original device if needed
+            if use_cpu:
+                A_inv = A_inv.to(device)
+                G_inv = G_inv.to(device)
+            
+            inverse_factors[name] = (A_inv, G_inv)
+        
+        return inverse_factors
+    
+    def apply_inverse(self, gradients, damping=1e-3):
+        """
+        Apply preconditioner: U = G^{-1} · grad · A^{-1}
+        
+        Args:
+            gradients: Dict {layer_name: weight_gradient_matrix}
+        Returns:
+            Dict of preconditioned gradients
+        """
+        inverse_factors = self.get_inverse_factors(damping)
+        preconditioned = {}
+        
+        for name, grad in gradients.items():
+            if name in inverse_factors:
+                A_inv, G_inv = inverse_factors[name]
+                # Remove bias row/col from A_inv
+                A_inv_weight = A_inv[:-1, :-1]
+                # Apply: G^{-1} @ grad @ A^{-1}
+                temp = grad @ A_inv_weight
+                preconditioned[name] = G_inv @ temp
+            else:
+                preconditioned[name] = grad
+        
+        return preconditioned
+    
+    def apply_fisher(self, gradients):
+        """
+        Apply Fisher matrix: F @ grad = (G ⊗ A) @ grad = G · grad · A^T
+        
+        Args:
+            gradients: Dict {layer_name: weight_gradient_matrix}
+        Returns:
+            Dict with Fisher applied
+        """
+        result = {}
+        
+        for name, grad in gradients.items():
+            if name in self.fisher_factors:
+                A = self.fisher_factors[name]['A']
+                G = self.fisher_factors[name]['G']
+                
+                # Handle bias: A is (in_dim+1)×(in_dim+1), grad is (out_dim)×(in_dim)
+                A_weight = A[:-1, :-1]  # Remove bias row/col
+                
+                # Apply Fisher: G · grad · A^T
+                temp = grad @ A_weight.T
+                result[name] = G @ temp
+            else:
+                result[name] = grad
+        
+        return result
     
     def _compute_inverses(self, damping=1e-3):
         """Internal method to compute Ā^{-1} and G^{-1} with Tikhonov damping."""

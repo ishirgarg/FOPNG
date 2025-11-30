@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from typing import Optional, Tuple, Dict, Any, List, Union
 from tqdm import tqdm
+import copy
 
 from config import Config
 from gradients import GradientMemory, GradientCollector, GTLCollector, AVECollector
@@ -288,8 +289,11 @@ class FOPNGMethod(ContinualMethod):
         if self.is_kfac:
             # KFAC: Precompute A = G^T @ F_old @ F_new^{-1} @ F_old @ G + λI
             # This is done once per epoch, then reused for all batches
+            # Similar to diagonal: compute F_new inverses once, reuse them
             print(f"  [KFAC] Precomputing projection matrix ({G.shape[1]} columns)...")
             saved_factors = self.fisher_estimator.fisher_factors
+            saved_inverses = self.fisher_estimator.cached_inverses
+            saved_inverses_valid = self.fisher_estimator.inverses_valid
             
             A_components = []
             for i in range(G.shape[1]):
@@ -324,8 +328,13 @@ class FOPNGMethod(ContinualMethod):
             else:
                 self.A_inv = torch.pinverse(A)
             
-            # Restore fisher_factors
+            # Store A for condition number check (same as diagonal)
+            self.A = A
+            
+            # Restore fisher_factors and cache state
             self.fisher_estimator.fisher_factors = saved_factors
+            self.fisher_estimator.cached_inverses = saved_inverses
+            self.fisher_estimator.inverses_valid = saved_inverses_valid
             print(f"  [KFAC] Precomputation complete")
         elif self.is_diagonal:
             # Diagonal Fisher approximation
@@ -440,12 +449,19 @@ class FOPNGMethod(ContinualMethod):
             F_new_inv_P_g_dict = self.fisher_estimator.apply_inverse(P_g_dict, lam)
             F_new_inv_P_g = self._flatten_gradients(F_new_inv_P_g_dict)
             
-            # Restore fisher_factors
-            self.fisher_estimator.fisher_factors = saved_factors
-            
             # Step 6: Normalize (use lr like diagonal does)
             denom = torch.sqrt((P_g * F_new_inv_P_g).sum() + 1e-8)
-            v_star = -lr * F_new_inv_P_g / (denom + 1e-8)
+            # Check for NaN/inf to prevent numerical instability
+            if torch.isnan(denom) or torch.isinf(denom) or denom <= 0:
+                # Fallback: use raw gradient if normalization fails
+                v_star = -lr * gradient / (gradient.norm() + 1e-8)
+            else:
+                v_star = -lr * F_new_inv_P_g / (denom + 1e-8)
+            
+            # Check for NaN in update and clip if necessary
+            if torch.isnan(v_star).any() or torch.isinf(v_star).any():
+                # Fallback: use raw gradient scaled by learning rate
+                v_star = -lr * gradient / (gradient.norm() + 1e-8)
             
             if return_intermediate:
                 # --- DIAGNOSTICS FOR CORRECTION (matching diagonal) ---
@@ -530,6 +546,9 @@ class FOPNGMethod(ContinualMethod):
                     'projected_to_raw_ratio_eucl': P_g_eucl_norm / (raw_norm + 1e-10),
                     'projected_to_raw_ratio_fisher': 0.0,  # Not computed for KFAC
                 })
+            
+            # Restore fisher_factors (we changed it to F_old in step 1)
+            self.fisher_estimator.fisher_factors = saved_factors
         elif self.is_diagonal:
             # Transform to Fisher space: g_F = F_old^{1/2} * g
             F_old_sqrt = torch.sqrt(F_old + 1e-10)
@@ -741,7 +760,6 @@ class FOPNGMethod(ContinualMethod):
         if self.F_old is None:
             if self.is_kfac:
                 # Deep copy KFAC dictionary structure
-                import copy
                 self.F_old = copy.deepcopy(F_new)
             else:
                 self.F_old = F_new.clone()
@@ -795,10 +813,15 @@ class FOPNGMethod(ContinualMethod):
         total_correct = 0
         total_samples = 0
         
-        # For K-FAC: Explicitly recompute inverses once at start of epoch
+        # For K-FAC: Explicitly recompute inverses once at start of epoch and cache them
         if self.is_kfac:
             print(f"[FOPNG] Computing matrix inverses for epoch...")
+            # Set fisher_factors to F_new and compute inverses
+            saved_factors = self.fisher_estimator.fisher_factors
+            self.fisher_estimator.fisher_factors = F_new
             self.fisher_estimator.recompute_inverses(damping=self.lambda_reg)
+            # Restore original fisher_factors
+            self.fisher_estimator.fisher_factors = saved_factors
         
         print(f"[FOPNG] Precomputing update matrices...")
         self._compute_update_prep(F_new, self.F_old, G, config.device)
