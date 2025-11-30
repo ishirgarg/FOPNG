@@ -721,3 +721,231 @@ class FOPNGMethod(ContinualMethod):
             multihead=multihead,
             task_id=task_id if multihead else None
         )
+
+class FNGMethod(ContinualMethod):
+    """
+    Fisher Natural Gradient.
+    Uses Fisher information to define a Riemannian metric for projection.
+    """
+    
+    def __init__(
+        self,
+        fisher_estimator: FisherEstimator = None,
+    ):
+        self.fisher_estimator = fisher_estimator or DiagonalFisherEstimator()
+        self.is_diagonal = isinstance(self.fisher_estimator, DiagonalFisherEstimator)
+    
+    def setup(self, model: nn.Module, config: Config):
+        self.lambda_reg = config.fopng_lambda_reg
+    
+    def _compute_update(
+        self,
+        gradient: torch.Tensor,
+        F_new: torch.Tensor,
+        device: str,
+        lr: float,
+        return_intermediate: bool = True
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, float]]]:
+        """
+        Compute FOPNG update step.
+        
+        If return_intermediate=True, returns (update, stats_dict) where stats_dict contains:
+        - raw_grad_norm: ||g||
+        - update_norm: ||v_star|| (final update)
+        - update_to_raw_ratio: ||v_star|| / ||g||
+        """
+        lam = self.lambda_reg
+        stats = {}
+
+        if self.is_diagonal:
+            F_inv_diag = 1.0 / (F_new + lam)
+            denom = torch.sqrt((gradient * (F_inv_diag * gradient)).sum())
+            v_star = -lr * F_inv_diag * gradient / (denom + 1e-8)
+            
+            if return_intermediate:
+                # Compute comprehensive statistics
+                raw_norm = gradient.norm().item()
+                v_star_norm = v_star.norm().item()
+                
+                stats.update({
+                    'raw_grad_norm': raw_norm,
+                    'update_norm': v_star_norm,
+                    'update_to_raw_ratio': v_star_norm / (raw_norm + 1e-10),
+                })
+        else:
+            raise NotImplemented("FNG only supports diagonal Fisher estimator.")
+        
+        if return_intermediate:
+            return v_star, stats
+        return v_star
+    
+    def train_epoch(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        train_loader: DataLoader,
+        criterion: nn.Module,
+        config: Config,
+        task_id: int,
+        multihead: bool = False,
+        progress_desc: Optional[str] = None
+    ) -> Tuple[float, float]:
+        
+        # For first task or if no stored gradients, use regular training
+        if task_id == 0:
+            return self._train_regular(
+                model, optimizer, train_loader, criterion, config,
+                task_id, multihead, progress_desc
+            )
+        
+        # Compute Fisher matrices
+        F_new = self.fisher_estimator.estimate(model, train_loader, criterion, config.device)
+        
+        # Log Fisher matrix properties (computed once per epoch)
+        fisher_new_norm = F_new.norm().item()
+        
+        # For diagonal Fisher, also track trace (sum of diagonal)
+        if self.is_diagonal:
+            fisher_new_trace = F_new.sum().item()
+        else:
+            fisher_new_trace = 0.0
+            raise NotImplemented("FNG only supports diagonal Fisher estimator.")
+        
+        model.train()
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        
+        iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
+        
+        # Accumulators for all metrics (log average per epoch)
+        batch_stats = {
+            'raw_grad_norm': [],
+            'update_norm': [],
+            'update_to_raw_ratio': [],  
+        }
+        
+        for x, y in iterator:
+            x = x.to(config.device)
+            y = y.to(config.device)
+            
+            if multihead:
+                output = model(x, task_id=task_id)
+            else:
+                output = model(x)
+            
+            loss = criterion(output, y)
+            model.zero_grad()
+            loss.backward()
+            
+            grad = get_grad_vector(model)
+            update, stats = self._compute_update(grad, F_new, config.device, config.lr, return_intermediate=True)
+            apply_update(model, update)
+            
+            # Accumulate all statistics
+            for key in batch_stats.keys():
+                if key in stats:
+                    batch_stats[key].append(stats[key])
+            
+            total_loss += loss.item() * x.size(0)
+            preds = output.argmax(dim=1)
+            total_correct += (preds == y).sum().item()
+            total_samples += x.size(0)
+        
+        # Compute means for all metrics
+        log_metrics = {
+            "task_id": task_id,
+        }
+        
+        # Fisher matrix metrics (per epoch)
+        log_metrics.update({
+            f"fisher_matrix/fisher_new_norm": fisher_new_norm,
+        })
+        
+        if fisher_new_trace is not None:
+            log_metrics.update({
+                f"fisher_matrix/fisher_new_trace": fisher_new_trace,
+            })
+        
+        # Gradient and update metrics (averaged over batches in epoch)
+        for key, values in batch_stats.items():
+            if values:
+                if key.startswith('correction/'):
+                    # Log correction metrics directly under correction/
+                    log_metrics[f"{key}_mean"] = np.mean(values)
+                    log_metrics[f"{key}_std"] = np.std(values)
+                else:
+                    # Log other gradients under fopng_gradients/
+                    log_metrics[f"fopng_gradients/{key}_mean"] = np.mean(values)
+                    log_metrics[f"fopng_gradients/{key}_std"] = np.std(values)
+        
+        # Log all metrics to wandb
+        log(log_metrics)
+        
+        return total_loss / total_samples, total_correct / total_samples
+    
+    def _train_regular(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        train_loader: DataLoader,
+        criterion: nn.Module,
+        config: Config,
+        task_id: int,
+        multihead: bool = False,
+        progress_desc: Optional[str] = None
+    ) -> Tuple[float, float]:
+        """Regular Adam training for first task."""
+        model.train()
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        
+        # Accumulators for gradient norms (log average per epoch)
+        raw_grad_norms = []
+        
+        iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
+        
+        for x, y in iterator:
+            x = x.to(config.device)
+            y = y.to(config.device)
+            
+            optimizer.zero_grad()
+            
+            if multihead:
+                logits = model(x, task_id=task_id)
+            else:
+                logits = model(x)
+            
+            loss = criterion(logits, y)
+            loss.backward()
+            
+            # Get raw gradient norm before optimizer step
+            grad = get_grad_vector(model)
+            raw_grad_norms.append(grad.norm().item())
+            
+            optimizer.step()
+            
+            total_loss += loss.item() * x.size(0)
+            preds = logits.argmax(dim=1)
+            total_correct += (preds == y).sum().item()
+            total_samples += x.size(0)
+        
+        # Log average gradient norms for this epoch (task 0, no FOPNG projection)
+        log({
+            f"fopng_gradients/raw_grad_norm_mean": np.mean(raw_grad_norms),
+            f"fopng_gradients/raw_grad_norm_std": np.std(raw_grad_norms),
+            "task_id": task_id,
+        })
+        
+        return total_loss / total_samples, total_correct / total_samples
+    
+    def after_task(
+        self,
+        model: nn.Module,
+        train_loader: DataLoader,
+        task_id: int,
+        config: Config,
+        multihead: bool = False
+    ):
+        pass

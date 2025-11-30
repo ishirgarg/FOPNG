@@ -18,9 +18,9 @@ from datasets import (
     build_split_cifar10_tasks,
     build_split_cifar100_tasks,
 )
-from optimizers import ContinualMethod, SGDMethod, OGDMethod, FOPNGMethod, AVECollector
-from gradients import GTLCollector
-from fisher import DiagonalFisherEstimator, FullFisherEstimator, fisher_norm_distance
+from optimizers import ContinualMethod, SGDMethod, OGDMethod, FOPNGMethod, FNGMethod, AVECollector
+from gradients import GTLCollector, GradientCollector
+from fisher import DiagonalFisherEstimator, FullFisherEstimator, FisherEstimator, fisher_norm_distance
 from utils import set_seed, evaluate
 from visualization import plot_results
 from logger import ExperimentLogger
@@ -417,6 +417,24 @@ def run_split_cifar100(
     return results, logger
 
 
+def _get_fisher_estimator(fisher_type: str = 'diagonal') -> FisherEstimator:
+    """Create a Fisher estimator by type."""
+    fisher_type = fisher_type.lower()
+    if fisher_type == 'full':
+        return FullFisherEstimator()
+    else:
+        return DiagonalFisherEstimator()
+
+
+def _get_collector(collector_type: str = 'gtl') -> GradientCollector:
+    """Create a gradient collector by type."""
+    collector_type = collector_type.lower()
+    if collector_type == 'ave':
+        return AVECollector()
+    else:
+        return GTLCollector()
+
+
 def _create_method(method_name: str, **kwargs) -> ContinualMethod:
     """Create a continual learning method by name."""
     method_name = method_name.lower()
@@ -424,30 +442,21 @@ def _create_method(method_name: str, **kwargs) -> ContinualMethod:
     if method_name == 'sgd':
         return SGDMethod()
     elif method_name == 'ogd':
-        collector_type = kwargs.get('collector', 'gtl')
-        if collector_type == 'ave':
-            collector = AVECollector()
-        else:
-            collector = GTLCollector()
+        collector = _get_collector(kwargs.get('collector', 'gtl'))
         max_dirs = kwargs.get('max_directions', 2000)
         return OGDMethod(collector=collector, max_directions=max_dirs)
     elif method_name == 'fopng':
-        fisher_type = kwargs.get('fisher', 'diagonal')
-        if fisher_type == 'full':
-            fisher_est = FullFisherEstimator()
-        else:
-            fisher_est = DiagonalFisherEstimator()
-        collector_type = kwargs.get('collector', 'ave')
-        if collector_type == 'gtl':
-            collector = GTLCollector()
-        else:
-            collector = AVECollector()
+        fisher_est = _get_fisher_estimator(kwargs.get('fisher', 'diagonal'))
+        collector = _get_collector(kwargs.get('collector', 'ave'))
         max_dirs = kwargs.get('max_directions', 2000)
         return FOPNGMethod(
             fisher_estimator=fisher_est,
             collector=collector,
             max_directions=max_dirs
         )
+    elif method_name == 'fng':
+        fisher_est = _get_fisher_estimator(kwargs.get('fisher', 'diagonal'))
+        return FNGMethod(fisher_estimator=fisher_est)
     else:
         raise ValueError(f"Unknown method: {method_name}")
 
@@ -462,6 +471,8 @@ def make_exp_name(args):
         parts.append(args.collector)
         parts.append(f"{args.max_directions}dirs")
         parts.append(f"lam{args.fopng_lambda_reg}")
+    elif args.method == "fng":
+        parts.append(args.fisher)
     elif args.method == "ogd":
         parts.append(args.collector)
         parts.append(f"{args.max_directions}dirs")
@@ -496,7 +507,7 @@ def main():
                         choices=["permuted_mnist", "rotated_mnist", "split_mnist", "split_cifar10", "split_cifar100"])
 
     parser.add_argument("--method", type=str, required=True,
-                        choices=["sgd", "ogd", "fopng"])
+                        choices=["sgd", "ogd", "fopng", "fng"])
 
     parser.add_argument("--batch_size", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=5)
