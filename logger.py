@@ -106,6 +106,8 @@ def init_wandb(
     wandb.define_metric("accuracy_progression/*", step_metric="trained_task")
     wandb.define_metric("loss/*", step_metric="trained_task")
     wandb.define_metric("param_drift/*", step_metric="trained_task")
+    wandb.define_metric("average_accuracy_test", step_metric="trained_task")
+    wandb.define_metric("average_accuracy_train", step_metric="trained_task")
     
     print(f"Wandb initialized: {_wandb_run.url}")
 
@@ -275,14 +277,34 @@ class ExperimentLogger:
             "eval_task": eval_task,
         }
         
-        current_step = _global_step
-        log(metrics)
-        
         # Store results for plot generation (separate train/test)
         if eval_task not in self.results:
             self.results[eval_task] = {'test': [], 'train': []}
         self.results[eval_task]['test'].append(eval_acc)
         self.results[eval_task]['train'].append(train_acc)
+        
+        # Compute and log average accuracy of all tasks trained so far
+        # Average test accuracy across all tasks that have been evaluated at this stage
+        all_test_accs = []
+        all_train_accs = []
+        for task_id in range(trained_task + 1):
+            if task_id in self.results:
+                test_accs = self.results[task_id].get('test', []) if isinstance(self.results[task_id], dict) else self.results[task_id]
+                train_accs = self.results[task_id].get('train', []) if isinstance(self.results[task_id], dict) else []
+                
+                # Only include the latest accuracy for this task (at current trained_task stage)
+                if test_accs and len(test_accs) > 0:
+                    all_test_accs.append(test_accs[-1])
+                if train_accs and len(train_accs) > 0:
+                    all_train_accs.append(train_accs[-1])
+        
+        if all_test_accs:
+            metrics["average_accuracy_test"] = np.mean(all_test_accs)
+        if all_train_accs:
+            metrics["average_accuracy_train"] = np.mean(all_train_accs)
+        
+        current_step = _global_step
+        log(metrics)
         
         # Store locally for CSV export
         self.eval_logs.append({

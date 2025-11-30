@@ -352,7 +352,11 @@ class FOPNGMethod(ContinualMethod):
                 # Calculate A matrix conditioning
                 a_norm = torch.norm(self.A).item()
                 a_inv_norm = torch.norm(self.A_inv).item()
-                a_cond = torch.linalg.cond(self.A).item()
+                if device != 'mps':
+                    a_cond = torch.linalg.cond(self.A).item()
+                else:
+                    # MPS backend does not support cond()
+                    a_cond = float('0.0')
 
                 # Ratios
                 ratio1 = step1_norm / (grad_norm + 1e-10)
