@@ -222,7 +222,8 @@ class KFACFisherEstimator(FisherEstimator):
         """
         print(f"[KFAC] Starting Fisher estimation (max {max_samples} samples)...")
         activations = {}
-        pre_activation_grads = {}
+        # Per-sample gradient accumulator (will accumulate g_i g_i^T for each sample)
+        per_sample_grad_accum = {}
         
         # ============================================================
         # HOOKS: Capture ā (forward) and g (backward)
@@ -235,20 +236,12 @@ class KFACFisherEstimator(FisherEstimator):
                 activations[name] = torch.cat([act, ones], dim=1)
             return hook
         
-        def save_pre_activation_grad(name):
-            def hook(module, grad_input, grad_output):
-                # grad_output[0] = ∂L/∂s (pre-activation gradient)
-                g = grad_output[0].detach().view(grad_output[0].size(0), -1)
-                pre_activation_grads[name] = g
-            return hook
-        
-        # Register hooks on Linear layers
+        # Register forward hooks on Linear layers (backward hooks registered per-batch for per-sample gradients)
         handles = []
         layer_names = []
         for name, module in model.named_modules():
             if isinstance(module, nn.Linear):
                 handles.append(module.register_forward_hook(save_activation(name)))
-                handles.append(module.register_full_backward_hook(save_pre_activation_grad(name)))
                 layer_names.append(name)
                 self.fisher_factors[name] = {'A': None, 'G': None}
         
@@ -277,7 +270,6 @@ class KFACFisherEstimator(FisherEstimator):
                 break
             
             # Forward pass (handle multihead models)
-            model.zero_grad()
             if task_id is not None:
                 output = model(data, task_id=task_id)
             else:
@@ -291,26 +283,85 @@ class KFACFisherEstimator(FisherEstimator):
                 else:
                     sampled_targets = output.detach()
             
-            # Backward pass
-            loss = criterion(output, sampled_targets)
-            loss.backward()
+            # Compute per-sample losses and gradients (exact Fisher formula)
+            # Use reduction='none' to get per-sample losses, then backward each separately
+            if isinstance(criterion, nn.CrossEntropyLoss):
+                # Create a criterion with no reduction for per-sample losses
+                per_sample_criterion = nn.CrossEntropyLoss(reduction='none')
+                per_sample_losses = per_sample_criterion(output, sampled_targets)
+            else:
+                # For other criteria, assume they support reduction='none'
+                per_sample_losses = criterion(output, sampled_targets)
+                if per_sample_losses.dim() > 0:
+                    # Already per-sample
+                    pass
+                else:
+                    # Scalar loss - need to handle differently
+                    per_sample_losses = per_sample_losses.unsqueeze(0).expand(batch_size)
             
-            # Accumulate outer products: A = Σ ā ā^T, G = Σ g g^T
+            # Clear per-sample gradient accumulator for this batch
+            per_sample_grad_accum.clear()
+            
+            # Register backward hooks for per-sample gradients
+            grad_handles = []
+            for name, module in model.named_modules():
+                if isinstance(module, nn.Linear) and name in layer_names:
+                    # Register a hook that will accumulate per-sample gradients
+                    def make_grad_hook(layer_name):
+                        def hook(module, grad_input, grad_output):
+                            # grad_output[0] = ∂L/∂s (pre-activation gradient)
+                            g = grad_output[0].detach().view(grad_output[0].size(0), -1)
+                            # For per-sample backward, g should be shape (1, out_dim) or (batch_size, out_dim)
+                            # We'll accumulate g_i g_i^T for each sample
+                            if g.size(0) == 1:
+                                # Single sample backward
+                                g_i = g[0:1]  # (1, out_dim)
+                                if layer_name not in per_sample_grad_accum:
+                                    per_sample_grad_accum[layer_name] = g_i.t() @ g_i
+                                else:
+                                    per_sample_grad_accum[layer_name] = per_sample_grad_accum[layer_name] + g_i.t() @ g_i
+                            else:
+                                # Batch backward - this shouldn't happen with per-sample, but handle it
+                                for i in range(g.size(0)):
+                                    g_i = g[i:i+1]  # (1, out_dim)
+                                    if layer_name not in per_sample_grad_accum:
+                                        per_sample_grad_accum[layer_name] = g_i.t() @ g_i
+                                    else:
+                                        per_sample_grad_accum[layer_name] = per_sample_grad_accum[layer_name] + g_i.t() @ g_i
+                        return hook
+                    grad_handles.append(module.register_full_backward_hook(make_grad_hook(name)))
+            
+            # Accumulate outer products per-sample: A = Σ_i ā_i ā_i^T, G = Σ_i g_i g_i^T
+            for i in range(batch_size):
+                model.zero_grad()
+                # Backward for single sample
+                per_sample_losses[i].backward(retain_graph=(i < batch_size - 1))
+            
+            # Remove gradient hooks
+            for handle in grad_handles:
+                handle.remove()
+            
+            # Accumulate activations (per-sample): A = Σ_i ā_i ā_i^T
             for name in layer_names:
-                if name in activations and name in pre_activation_grads:
-                    act = activations[name]
-                    g = pre_activation_grads[name]
-                    
+                if name in activations:
+                    act = activations[name]  # (batch_size, in_dim+1)
+                    # Accumulate per-sample: Σ_i act_i act_i^T
                     if A_sum[name] is None:
-                        A_sum[name] = act.t() @ act
-                        G_sum[name] = g.t() @ g
+                        A_sum[name] = act.t() @ act  # This correctly computes Σ_i act_i act_i^T
                     else:
                         A_sum[name] = A_sum[name] + act.t() @ act
-                        G_sum[name] = G_sum[name] + g.t() @ g
+            
+            # Accumulate gradients (already accumulated in hooks): G = Σ_i g_i g_i^T
+            for name in layer_names:
+                if name in per_sample_grad_accum:
+                    if G_sum[name] is None:
+                        G_sum[name] = per_sample_grad_accum[name]
+                    else:
+                        G_sum[name] = G_sum[name] + per_sample_grad_accum[name]
             
             n_samples += batch_size
             activations.clear()
-            pre_activation_grads.clear()
+            per_sample_grad_accum.clear()
         
         # Cleanup and normalize
         for handle in handles:
@@ -364,9 +415,10 @@ class KFACFisherEstimator(FisherEstimator):
         """
         Incrementally update running averages of A and G with a single mini-batch.
         This is the proper online K-FAC update for use during training.
+        Uses exact per-sample formula: A = E[ā_i ā_i^T], G = E[g_i g_i^T]
         """
         activations = {}
-        pre_activation_grads = {}
+        per_sample_grad_accum = {}
         
         # Hook setup
         def save_activation(name):
@@ -376,25 +428,19 @@ class KFACFisherEstimator(FisherEstimator):
                 activations[name] = torch.cat([act, ones], dim=1)
             return hook
         
-        def save_pre_activation_grad(name):
-            def hook(module, grad_input, grad_output):
-                g = grad_output[0].detach().view(grad_output[0].size(0), -1)
-                pre_activation_grads[name] = g
-            return hook
-        
-        # Register hooks
+        # Register forward hooks
         handles = []
+        layer_names = []
         for name, module in model.named_modules():
             if isinstance(module, nn.Linear):
                 handles.append(module.register_forward_hook(save_activation(name)))
-                handles.append(module.register_full_backward_hook(save_pre_activation_grad(name)))
+                layer_names.append(name)
                 if name not in self.fisher_factors:
                     self.fisher_factors[name] = {'A': None, 'G': None}
         
-        # Forward + backward pass
+        # Forward pass
         was_training = model.training
         model.train()
-        model.zero_grad()
         
         if task_id is not None:
             output = model(data, task_id=task_id)
@@ -409,34 +455,66 @@ class KFACFisherEstimator(FisherEstimator):
             else:
                 sampled_targets = output.detach()
         
-        loss = criterion(output, sampled_targets)
-        loss.backward()
-        
-        # Update running averages
+        # Compute per-sample losses
         batch_size = data.size(0)
-        for name in list(activations.keys()):
-            if name in activations and name in pre_activation_grads:
-                act = activations[name]
-                g = pre_activation_grads[name]
-                
-                # Compute batch statistics
+        if isinstance(criterion, nn.CrossEntropyLoss):
+            per_sample_criterion = nn.CrossEntropyLoss(reduction='none')
+            per_sample_losses = per_sample_criterion(output, sampled_targets)
+        else:
+            per_sample_losses = criterion(output, sampled_targets)
+            if per_sample_losses.dim() == 0:
+                per_sample_losses = per_sample_losses.unsqueeze(0).expand(batch_size)
+        
+        # Register backward hooks for per-sample gradients
+        grad_handles = []
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear) and name in layer_names:
+                def make_grad_hook(layer_name):
+                    def hook(module, grad_input, grad_output):
+                        g = grad_output[0].detach().view(grad_output[0].size(0), -1)
+                        if g.size(0) == 1:
+                            g_i = g[0:1]
+                            if layer_name not in per_sample_grad_accum:
+                                per_sample_grad_accum[layer_name] = g_i.t() @ g_i
+                            else:
+                                per_sample_grad_accum[layer_name] = per_sample_grad_accum[layer_name] + g_i.t() @ g_i
+                    return hook
+                grad_handles.append(module.register_full_backward_hook(make_grad_hook(name)))
+        
+        # Backward per-sample
+        for i in range(batch_size):
+            model.zero_grad()
+            per_sample_losses[i].backward(retain_graph=(i < batch_size - 1))
+        
+        # Remove gradient hooks
+        for handle in grad_handles:
+            handle.remove()
+        
+        # Update running averages with per-sample statistics
+        for name in layer_names:
+            if name in activations:
+                act = activations[name]  # (batch_size, in_dim+1)
+                # A_batch = (1/batch_size) * Σ_i act_i act_i^T
                 A_batch = (act.t() @ act) / batch_size
-                G_batch = (g.t() @ g) / batch_size
                 
-                if self.fisher_factors[name]['A'] is None:
-                    # First time: initialize
-                    self.fisher_factors[name]['A'] = A_batch
-                    self.fisher_factors[name]['G'] = G_batch
-                else:
-                    # Moving average: A = ε*A_old + (1-ε)*A_batch
-                    self.fisher_factors[name]['A'] = (
-                        self.epsilon * self.fisher_factors[name]['A'] + 
-                        (1 - self.epsilon) * A_batch
-                    )
-                    self.fisher_factors[name]['G'] = (
-                        self.epsilon * self.fisher_factors[name]['G'] + 
-                        (1 - self.epsilon) * G_batch
-                    )
+                if name in per_sample_grad_accum:
+                    # G_batch = (1/batch_size) * Σ_i g_i g_i^T
+                    G_batch = per_sample_grad_accum[name] / batch_size
+                    
+                    if self.fisher_factors[name]['A'] is None:
+                        # First time: initialize
+                        self.fisher_factors[name]['A'] = A_batch
+                        self.fisher_factors[name]['G'] = G_batch
+                    else:
+                        # Moving average: A = ε*A_old + (1-ε)*A_batch
+                        self.fisher_factors[name]['A'] = (
+                            self.epsilon * self.fisher_factors[name]['A'] + 
+                            (1 - self.epsilon) * A_batch
+                        )
+                        self.fisher_factors[name]['G'] = (
+                            self.epsilon * self.fisher_factors[name]['G'] + 
+                            (1 - self.epsilon) * G_batch
+                        )
         
         # Cleanup
         for handle in handles:
