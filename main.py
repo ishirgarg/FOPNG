@@ -57,7 +57,7 @@ def run_experiment(
     
     # Default optimizer selection
     if optimizer_class is None:
-        if isinstance(method, FOPNGMethod):
+        if isinstance(method, FOPNGMethod) or isinstance(method, AdamMethod):
             optimizer_class = torch.optim.Adam
         else:
             optimizer_class = torch.optim.SGD
