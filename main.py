@@ -509,7 +509,7 @@ def main():
                         choices=["permuted_mnist", "rotated_mnist", "split_mnist", "split_cifar10", "split_cifar100"])
 
     parser.add_argument("--method", type=str, required=True,
-                        choices=["sgd", "ogd", "fopng", "fng"])
+                        choices=["sgd", "adam", "ogd", "fopng", "fng"])
 
     parser.add_argument("--batch_size", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=5)
