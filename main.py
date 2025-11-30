@@ -456,12 +456,14 @@ def _create_method(method_name: str, **kwargs) -> ContinualMethod:
         max_dirs = kwargs.get('max_directions', 2000)
         kfac_samples = kwargs.get('kfac_samples', 1000)
         kfac_update_freq = kwargs.get('kfac_update_freq', 1)
+        kfac_running_update = kwargs.get('kfac_running_update', False)
         return FOPNGMethod(
             fisher_estimator=fisher_est,
             collector=collector,
             max_directions=max_dirs,
             kfac_samples=kfac_samples,
-            kfac_update_freq=kfac_update_freq
+            kfac_update_freq=kfac_update_freq,
+            kfac_running_update=kfac_running_update
         )
     else:
         raise ValueError(f"Unknown method: {method_name}")
@@ -554,6 +556,8 @@ def main():
                         help="Number of samples for K-FAC Fisher estimation")
     parser.add_argument("--kfac_update_freq", type=int, default=1,
                         help="How often to update K-FAC running average (1=every batch)")
+    parser.add_argument("--kfac_running_update", action="store_true", default=False,
+                        help="Enable running Fisher updates during training (default False to match diagonal)")
     parser.add_argument("--kfac_inversion_freq", type=int, default=None,
                         help="How often to recompute matrix inverses (None=manual, e.g. 10, 50, 100)")
     parser.add_argument("--kfac_use_running_avg", action="store_true", default=True,
@@ -625,6 +629,7 @@ def main():
             kfac_epsilon=args.kfac_epsilon,
             kfac_samples=args.kfac_samples,
             kfac_update_freq=args.kfac_update_freq,
+            kfac_running_update=args.kfac_running_update,
             kfac_inversion_freq=args.kfac_inversion_freq,
             kfac_use_running_avg=args.kfac_use_running_avg,
         )
@@ -640,6 +645,7 @@ def main():
             kfac_epsilon=args.kfac_epsilon,
             kfac_samples=args.kfac_samples,
             kfac_update_freq=args.kfac_update_freq,
+            kfac_running_update=args.kfac_running_update,
             kfac_inversion_freq=args.kfac_inversion_freq,
             kfac_use_running_avg=args.kfac_use_running_avg,
         )
@@ -654,6 +660,7 @@ def main():
             kfac_epsilon=args.kfac_epsilon,
             kfac_samples=args.kfac_samples,
             kfac_update_freq=args.kfac_update_freq,
+            kfac_running_update=args.kfac_running_update,
             kfac_inversion_freq=args.kfac_inversion_freq,
             kfac_use_running_avg=args.kfac_use_running_avg,
         )

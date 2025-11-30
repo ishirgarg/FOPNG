@@ -254,7 +254,8 @@ class FOPNGMethod(ContinualMethod):
         collector: GradientCollector = None,
         max_directions: int = 2000,
         kfac_samples: int = 1000,
-        kfac_update_freq: int = 1
+        kfac_update_freq: int = 1,
+        kfac_running_update: bool = False
     ):
         self.fisher_estimator = fisher_estimator or DiagonalFisherEstimator()
         self.collector = collector or AVECollector()
@@ -266,6 +267,7 @@ class FOPNGMethod(ContinualMethod):
         self.model = None
         self.kfac_samples = kfac_samples  # Number of samples for K-FAC Fisher estimation
         self.kfac_update_freq = kfac_update_freq  # How often to update running avg (1=every batch)
+        self.kfac_running_update = kfac_running_update  # Whether to update Fisher during training (default False to match diagonal)
     
     def setup(self, model: nn.Module, config: Config):
         self.memory.clear()
@@ -426,6 +428,7 @@ class FOPNGMethod(ContinualMethod):
             
             # Step 4: Project: correction = F_old @ G @ A^{-1} @ G^T @ F_old @ g
             correction_vec = G @ A_inv_G_T_F_old_g
+            correction_unweighted = correction_vec.clone()  # Save for diagnostics
             correction_dict = self._split_gradient_to_layers(correction_vec)
             correction_dict_applied = self.fisher_estimator.apply_fisher(correction_dict)
             correction = self._flatten_gradients(correction_dict_applied)
@@ -445,6 +448,63 @@ class FOPNGMethod(ContinualMethod):
             v_star = -lr * F_new_inv_P_g / (denom + 1e-8)
             
             if return_intermediate:
+                # --- DIAGNOSTICS FOR CORRECTION (matching diagonal) ---
+                # Calculate norms for pipeline steps
+                step1_norm = F_old_g.norm().item()
+                step2_norm = G_T_F_old_g.norm().item()
+                step3_norm = A_inv_G_T_F_old_g.norm().item()
+                step4_norm = correction_unweighted.norm().item()
+                step5_norm = correction.norm().item()
+                grad_norm = gradient.norm().item()
+                
+                # Calculate matrix properties
+                g_norm = G.norm().item()
+                dim = G.shape[0]
+                g_normalized = g_norm / (np.sqrt(dim) + 1e-10)
+                
+                # Calculate A matrix conditioning
+                a_norm = torch.norm(self.A).item()
+                a_inv_norm = torch.norm(self.A_inv).item()
+                a_cond = torch.linalg.cond(self.A).item()
+                
+                # Compute F_old norm (aggregate across layers for KFAC)
+                if isinstance(F_old, dict):
+                    f_old_norm = sum(
+                        F_old[name]['A'].norm().item() + F_old[name]['G'].norm().item()
+                        for name in F_old
+                    )
+                else:
+                    f_old_norm = F_old.norm().item()
+                
+                # Ratios
+                ratio1 = step1_norm / (grad_norm + 1e-10)
+                ratio2 = step2_norm / (step1_norm + 1e-10)
+                ratio3 = step3_norm / (step2_norm + 1e-10)
+                ratio4 = step4_norm / (step3_norm + 1e-10)
+                ratio5 = step5_norm / (step4_norm + 1e-10)
+                
+                stats.update({
+                    'correction/step1_norm_F_old_g': step1_norm,
+                    'correction/step2_norm_G_T_F_old_g': step2_norm,
+                    'correction/step3_norm_A_inv_G_T': step3_norm,
+                    'correction/step4_norm_correction_unweighted': step4_norm,
+                    'correction/step5_norm_correction_final': step5_norm,
+                    
+                    'correction/ratio1_Fold_g_vs_g': ratio1,
+                    'correction/ratio2_proj_vs_Fold_g': ratio2,
+                    'correction/ratio3_Ainv_vs_proj': ratio3,
+                    'correction/ratio4_unweighted_vs_Ainv': ratio4,
+                    'correction/ratio5_final_vs_unweighted': ratio5,
+                    
+                    'correction/G_norm_normalized': g_normalized,
+                    'correction/G_abs_mean': G.abs().mean().item(),
+                    'correction/A_condition_number': a_cond,
+                    'correction/A_norm': a_norm,
+                    'correction/A_inv_norm': a_inv_norm,
+                    
+                    'correction/lambda_ratio_Fold': f_old_norm / (lam + 1e-10),
+                })
+                
                 # Compute comprehensive statistics (same structure as diagonal)
                 raw_norm = gradient.norm().item()
                 fisher_norm = F_old_g.norm().item()  # Use F_old @ g as "Fisher space" analog
@@ -461,7 +521,7 @@ class FOPNGMethod(ContinualMethod):
                     'fisher_grad_norm': fisher_norm,
                     'correction_norm': correction_norm,
                     'projected_grad_eucl_norm': P_g_eucl_norm,
-                    'projected_grad_fisher_norm': 0.0,  # Not computed for KFAC
+                    'projected_grad_fisher_norm': 0.0,  # Not computed for KFAC (would need F_old^{1/2})
                     'update_norm': v_star_norm,
                     'projection_relative_change': projection_relative_change,
                     'fisher_projection_relative_change': 0.0,  # Not computed for KFAC
@@ -796,8 +856,8 @@ class FOPNGMethod(ContinualMethod):
             model.zero_grad()
             loss.backward()
             
-            # K-FAC: Update running average of Fisher factors during training
-            if self.is_kfac and batch_num % self.kfac_update_freq == 0:
+            # K-FAC: Update running average of Fisher factors during training (only if enabled)
+            if self.is_kfac and self.kfac_running_update and batch_num % self.kfac_update_freq == 0:
                 self.fisher_estimator.update_running_average(
                     model, x, y, criterion, config.device,
                     task_id=task_id if multihead else None
