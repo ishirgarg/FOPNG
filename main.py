@@ -19,6 +19,8 @@ from utils import set_seed, evaluate
 from visualization import plot_results
 from logger import ExperimentLogger
 
+PYTORCH_ENABLE_MPS_FALLBACK=1
+
 def run_experiment(
     tasks: List[Tuple[DataLoader, DataLoader]],
     model: nn.Module,
@@ -337,7 +339,14 @@ def _create_method(method_name: str, **kwargs) -> ContinualMethod:
     elif method_name == 'fopng':
         fisher_type = kwargs.get('fisher', 'diagonal')
         if fisher_type == 'kfac':
-            fisher_est = KFACFisherEstimator()
+            kfac_epsilon = kwargs.get('kfac_epsilon', 0.95)
+            kfac_use_running = kwargs.get('kfac_use_running_avg', True)
+            kfac_inversion_freq = kwargs.get('kfac_inversion_freq', None)
+            fisher_est = KFACFisherEstimator(
+                epsilon=kfac_epsilon,
+                use_running_avg=kfac_use_running,
+                inversion_freq=kfac_inversion_freq
+            )
         elif fisher_type == 'full':
             fisher_est = FullFisherEstimator()
         else:
@@ -348,10 +357,14 @@ def _create_method(method_name: str, **kwargs) -> ContinualMethod:
         else:
             collector = AVECollector()
         max_dirs = kwargs.get('max_directions', 2000)
+        kfac_samples = kwargs.get('kfac_samples', 1000)
+        kfac_update_freq = kwargs.get('kfac_update_freq', 1)
         return FOPNGMethod(
             fisher_estimator=fisher_est,
             collector=collector,
-            max_directions=max_dirs
+            max_directions=max_dirs,
+            kfac_samples=kfac_samples,
+            kfac_update_freq=kfac_update_freq
         )
     else:
         raise ValueError(f"Unknown method: {method_name}")
@@ -432,6 +445,18 @@ def main():
     parser.add_argument("--fopng_epsilon", type=float, default=0.0,
                         help="Epsilon parameter for FOPNG")
 
+    # K-FAC specific
+    parser.add_argument("--kfac_epsilon", type=float, default=0.95,
+                        help="Moving average decay parameter for K-FAC (0.95 = 95%% old, 5%% new)")
+    parser.add_argument("--kfac_samples", type=int, default=1000,
+                        help="Number of samples for K-FAC Fisher estimation")
+    parser.add_argument("--kfac_update_freq", type=int, default=1,
+                        help="How often to update K-FAC running average (1=every batch)")
+    parser.add_argument("--kfac_inversion_freq", type=int, default=None,
+                        help="How often to recompute matrix inverses (None=manual, e.g. 10, 50, 100)")
+    parser.add_argument("--kfac_use_running_avg", action="store_true", default=True,
+                        help="Use running averages for K-FAC (recommended)")
+
     # --------------------------------
     # Logging / saving
     # --------------------------------
@@ -480,6 +505,11 @@ def main():
             collector=args.collector,
             fisher=args.fisher,
             max_directions=args.max_directions,
+            kfac_epsilon=args.kfac_epsilon,
+            kfac_samples=args.kfac_samples,
+            kfac_update_freq=args.kfac_update_freq,
+            kfac_inversion_freq=args.kfac_inversion_freq,
+            kfac_use_running_avg=args.kfac_use_running_avg,
         )
 
     elif args.dataset == "rotated_mnist":
@@ -490,6 +520,11 @@ def main():
             collector=args.collector,
             fisher=args.fisher,
             max_directions=args.max_directions,
+            kfac_epsilon=args.kfac_epsilon,
+            kfac_samples=args.kfac_samples,
+            kfac_update_freq=args.kfac_update_freq,
+            kfac_inversion_freq=args.kfac_inversion_freq,
+            kfac_use_running_avg=args.kfac_use_running_avg,
         )
 
     elif args.dataset == "split_mnist":
@@ -499,6 +534,11 @@ def main():
             collector=args.collector,
             fisher=args.fisher,
             max_directions=args.max_directions,
+            kfac_epsilon=args.kfac_epsilon,
+            kfac_samples=args.kfac_samples,
+            kfac_update_freq=args.kfac_update_freq,
+            kfac_inversion_freq=args.kfac_inversion_freq,
+            kfac_use_running_avg=args.kfac_use_running_avg,
         )
 
 

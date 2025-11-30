@@ -95,11 +95,18 @@ class FullFisherEstimator(FisherEstimator):
 
 
 class KFACFisherEstimator(FisherEstimator):
-    """KFAC block-diagonal Fisher approximation."""
+    """KFAC block-diagonal Fisher approximation with moving averages."""
     
-    def __init__(self):
+    def __init__(self, epsilon=0.95, use_running_avg=True, inversion_freq=None):
         super().__init__()
-        self.fisher_factors = {}
+        self.fisher_factors = {}  # Running averages of A and G
+        self.epsilon = epsilon  # Moving average decay parameter
+        self.use_running_avg = use_running_avg  # Whether to use incremental updates
+        self.step_count = 0  # Track number of updates
+        self.inversion_freq = inversion_freq  # How often to recompute inverses (None = manual)
+        self.cached_inverses = {}  # Cached inverse factors
+        self.inverses_valid = False  # Whether cached inverses are up-to-date
+        self.last_inversion_step = -1  # Last step when inverses were computed
     
     def estimate(
         self,
@@ -107,9 +114,17 @@ class KFACFisherEstimator(FisherEstimator):
         dataloader: DataLoader,
         criterion: nn.Module,
         device: str,
-        task_id: Optional[int] = None
+        task_id: Optional[int] = None,
+        max_samples: int = 1000
     ) -> dict:
-        """Compute A and G factors for each layer."""
+        """
+        Compute A and G factors for each layer.
+        
+        Args:
+            max_samples: Maximum number of samples to use (default 1000).
+                        Use fewer samples for speed vs. full dataset for accuracy.
+        """
+        print(f"[KFAC] Starting Fisher estimation (max {max_samples} samples)...")
         activations = {}
         pre_activation_grads = {}
         
@@ -152,9 +167,18 @@ class KFACFisherEstimator(FisherEstimator):
         G_sum = {name: None for name in layer_names}
         n_samples = 0
         
+        batch_count = 0
         for data, target in dataloader:
+            batch_count += 1
+            if batch_count % 50 == 0:
+                print(f"[KFAC] Batch {batch_count}, samples: {n_samples}...")
             data, target = data.to(device), target.to(device)
             batch_size = data.size(0)
+            
+            # Early exit if we've collected enough samples
+            if n_samples >= max_samples:
+                print(f"[KFAC] Reached max_samples ({max_samples}), stopping early")
+                break
             
             # Forward pass (handle multihead models)
             model.zero_grad()
@@ -201,18 +225,159 @@ class KFACFisherEstimator(FisherEstimator):
         
         for name in layer_names:
             if A_sum[name] is not None and G_sum[name] is not None:
-                self.fisher_factors[name]['A'] = A_sum[name] / n_samples
-                self.fisher_factors[name]['G'] = G_sum[name] / n_samples
+                A_new = A_sum[name] / n_samples
+                G_new = G_sum[name] / n_samples
+                
+                if self.use_running_avg and name in self.fisher_factors and \
+                   self.fisher_factors[name]['A'] is not None:
+                    # Update with moving average: A = ε*A_old + (1-ε)*A_new
+                    self.fisher_factors[name]['A'] = (
+                        self.epsilon * self.fisher_factors[name]['A'] + 
+                        (1 - self.epsilon) * A_new
+                    )
+                    self.fisher_factors[name]['G'] = (
+                        self.epsilon * self.fisher_factors[name]['G'] + 
+                        (1 - self.epsilon) * G_new
+                    )
+                else:
+                    # First time or not using running average: initialize
+                    self.fisher_factors[name]['A'] = A_new
+                    self.fisher_factors[name]['G'] = G_new
             else:
                 # Hooks didn't capture (e.g., unused heads in multihead models)
                 # Skip this layer - don't add to fisher_factors
-                print(f"Warning: No activations captured for layer {name}")
-                del self.fisher_factors[name]
+                print(f"[KFAC] Warning: No activations captured for layer {name}")
+                if name in self.fisher_factors:
+                    del self.fisher_factors[name]
         
+        self.step_count += 1
+        self.inverses_valid = False  # Invalidate cached inverses
+        avg_type = "moving average" if self.use_running_avg else "batch estimate"
+        print(f"[KFAC] Fisher estimation complete ({len(self.fisher_factors)} layers, {avg_type})")
         return self.fisher_factors
     
+    def update_running_average(
+        self,
+        model: nn.Module,
+        data: torch.Tensor,
+        target: torch.Tensor,
+        criterion: nn.Module,
+        device: str,
+        task_id: Optional[int] = None
+    ):
+        """
+        Incrementally update running averages of A and G with a single mini-batch.
+        This is the proper online K-FAC update for use during training.
+        """
+        activations = {}
+        pre_activation_grads = {}
+        
+        # Hook setup
+        def save_activation(name):
+            def hook(module, input, output):
+                act = input[0].detach().view(input[0].size(0), -1)
+                ones = torch.ones(act.size(0), 1, device=act.device)
+                activations[name] = torch.cat([act, ones], dim=1)
+            return hook
+        
+        def save_pre_activation_grad(name):
+            def hook(module, grad_input, grad_output):
+                g = grad_output[0].detach().view(grad_output[0].size(0), -1)
+                pre_activation_grads[name] = g
+            return hook
+        
+        # Register hooks
+        handles = []
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear):
+                handles.append(module.register_forward_hook(save_activation(name)))
+                handles.append(module.register_full_backward_hook(save_pre_activation_grad(name)))
+                if name not in self.fisher_factors:
+                    self.fisher_factors[name] = {'A': None, 'G': None}
+        
+        # Forward + backward pass
+        was_training = model.training
+        model.train()
+        model.zero_grad()
+        
+        if task_id is not None:
+            output = model(data, task_id=task_id)
+        else:
+            output = model(data)
+        
+        # Sample from model distribution
+        with torch.no_grad():
+            if isinstance(criterion, nn.CrossEntropyLoss):
+                probs = torch.softmax(output, dim=1)
+                sampled_targets = torch.multinomial(probs, 1).squeeze()
+            else:
+                sampled_targets = output.detach()
+        
+        loss = criterion(output, sampled_targets)
+        loss.backward()
+        
+        # Update running averages
+        batch_size = data.size(0)
+        for name in list(activations.keys()):
+            if name in activations and name in pre_activation_grads:
+                act = activations[name]
+                g = pre_activation_grads[name]
+                
+                # Compute batch statistics
+                A_batch = (act.t() @ act) / batch_size
+                G_batch = (g.t() @ g) / batch_size
+                
+                if self.fisher_factors[name]['A'] is None:
+                    # First time: initialize
+                    self.fisher_factors[name]['A'] = A_batch
+                    self.fisher_factors[name]['G'] = G_batch
+                else:
+                    # Moving average: A = ε*A_old + (1-ε)*A_batch
+                    self.fisher_factors[name]['A'] = (
+                        self.epsilon * self.fisher_factors[name]['A'] + 
+                        (1 - self.epsilon) * A_batch
+                    )
+                    self.fisher_factors[name]['G'] = (
+                        self.epsilon * self.fisher_factors[name]['G'] + 
+                        (1 - self.epsilon) * G_batch
+                    )
+        
+        # Cleanup
+        for handle in handles:
+            handle.remove()
+        model.train(was_training)
+        
+        self.step_count += 1
+        self.inverses_valid = False  # Invalidate cached inverses when A and G change
+        
+        # Optionally recompute inverses if frequency is set
+        if self.inversion_freq is not None and \
+           self.step_count - self.last_inversion_step >= self.inversion_freq:
+            self.recompute_inverses(damping=1e-3)
+    
+    def recompute_inverses(self, damping=1e-3):
+        """
+        Explicitly recompute and cache inverse factors.
+        Should be called after A and G have been updated significantly.
+        """
+        print(f"[KFAC] Recomputing inverses (step {self.step_count})...")
+        self.cached_inverses = self._compute_inverses(damping)
+        self.inverses_valid = True
+        self.last_inversion_step = self.step_count
+    
     def get_inverse_factors(self, damping=1e-3):
-        """Compute Ā^{-1} and G^{-1} with Tikhonov damping."""
+        """
+        Get inverse factors. Uses cache if valid, otherwise recomputes.
+        
+        Note: For efficiency, explicitly call recompute_inverses() when needed
+        rather than relying on automatic recomputation.
+        """
+        if not self.inverses_valid or not self.cached_inverses:
+            self.recompute_inverses(damping)
+        return self.cached_inverses
+    
+    def _compute_inverses(self, damping=1e-3):
+        """Internal method to compute Ā^{-1} and G^{-1} with Tikhonov damping."""
         inverse_factors = {}
         sqrt_damping = torch.sqrt(torch.tensor(damping))
         
@@ -238,9 +403,12 @@ class KFACFisherEstimator(FisherEstimator):
             
             # Invert (use Cholesky for stability)
             try:
-                A_inv = torch.cholesky_inverse(torch.linalg.cholesky(A_damped))
-                G_inv = torch.cholesky_inverse(torch.linalg.cholesky(G_damped))
-            except:
+                A_chol = torch.linalg.cholesky(A_damped)
+                A_inv = torch.cholesky_inverse(A_chol)
+                
+                G_chol = torch.linalg.cholesky(G_damped)
+                G_inv = torch.cholesky_inverse(G_chol)
+            except Exception as e:
                 A_inv = torch.linalg.inv(A_damped)
                 G_inv = torch.linalg.inv(G_damped)
             
@@ -273,7 +441,8 @@ class KFACFisherEstimator(FisherEstimator):
                 A_inv_weight = A_inv[:-1, :-1]  # Remove bias row/col
                 
                 # Precondition: G^{-1} · grad · A^{-1}
-                preconditioned[name] = G_inv @ grad @ A_inv_weight
+                temp = grad @ A_inv_weight
+                preconditioned[name] = G_inv @ temp
             else:
                 preconditioned[name] = grad
         
@@ -299,7 +468,8 @@ class KFACFisherEstimator(FisherEstimator):
                 A_weight = A[:-1, :-1]  # Remove bias row/col
                 
                 # Apply Fisher: G · grad · A^T
-                result[name] = G @ grad @ A_weight.T
+                temp = grad @ A_weight.T
+                result[name] = G @ temp
             else:
                 result[name] = grad
         

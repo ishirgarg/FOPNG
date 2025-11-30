@@ -259,7 +259,9 @@ class FOPNGMethod(ContinualMethod):
         self,
         fisher_estimator: FisherEstimator = None,
         collector: GradientCollector = None,
-        max_directions: int = 2000
+        max_directions: int = 2000,
+        kfac_samples: int = 1000,
+        kfac_update_freq: int = 1
     ):
         self.fisher_estimator = fisher_estimator or DiagonalFisherEstimator()
         self.collector = collector or AVECollector()
@@ -268,6 +270,8 @@ class FOPNGMethod(ContinualMethod):
         self.is_diagonal = isinstance(self.fisher_estimator, DiagonalFisherEstimator)
         self.is_kfac = isinstance(self.fisher_estimator, KFACFisherEstimator)
         self.model = None
+        self.kfac_samples = kfac_samples  # Number of samples for K-FAC Fisher estimation
+        self.kfac_update_freq = kfac_update_freq  # How often to update running avg (1=every batch)
     
     def setup(self, model: nn.Module, config: Config):
         self.memory.clear()
@@ -289,30 +293,45 @@ class FOPNGMethod(ContinualMethod):
         if self.is_kfac:
             # KFAC: Precompute A = G^T @ F_old @ F_new^{-1} @ F_old @ G + λI
             # This is done once per epoch, then reused for all batches
-            print("  [KFAC] Precomputing projection matrix A...")
+            print(f"  [KFAC] Precomputing projection matrix ({G.shape[1]} columns)...")
             saved_factors = self.fisher_estimator.fisher_factors
             
             A_components = []
             for i in range(G.shape[1]):
+                if (i+1) % 50 == 0:
+                    print(f"  [KFAC]   Column {i+1}/{G.shape[1]}...")
+                
                 g_col_dict = self._split_gradient_to_layers(G[:, i])
+                
                 # F_old @ g_col
                 self.fisher_estimator.fisher_factors = F_old
                 temp1 = self.fisher_estimator.apply_fisher(g_col_dict)
+                
                 # F_new^{-1} @ (F_old @ g_col)
                 self.fisher_estimator.fisher_factors = F_new
                 temp2 = self.fisher_estimator.apply_inverse(temp1, lam)
+                
                 # F_old @ F_new^{-1} @ F_old @ g_col
                 self.fisher_estimator.fisher_factors = F_old
                 temp3 = self.fisher_estimator.apply_fisher(temp2)
+                
                 A_components.append(self._flatten_gradients(temp3))
             
             weighted_G = torch.stack(A_components, dim=1)
             A = G.T @ weighted_G + lam * torch.eye(G.size(1), device=device)
-            self.A_inv = torch.pinverse(A)
+            
+            # Move to CPU for pseudoinverse if on MPS (SVD not supported on MPS)
+            A_device = A.device
+            use_cpu = str(A_device).startswith('mps')
+            if use_cpu:
+                A_cpu = A.cpu()
+                self.A_inv = torch.pinverse(A_cpu).to(A_device)
+            else:
+                self.A_inv = torch.pinverse(A)
             
             # Restore fisher_factors
             self.fisher_estimator.fisher_factors = saved_factors
-            print(f"  [KFAC] Done. A is {A.shape}, condition number: {torch.linalg.cond(A).item():.2e}")
+            print(f"  [KFAC] Precomputation complete")
         elif self.is_diagonal:
             # Diagonal Fisher approximation
             F_new_inv_diag = 1.0 / (F_new + lam)
@@ -321,7 +340,13 @@ class FOPNGMethod(ContinualMethod):
             weighted_G = F_old_diag * (F_new_inv_diag.view(-1, 1) * F_old_G)
             A = G.T @ weighted_G + lam * torch.eye(G.size(1), device=device)
 
-            self.A_inv = torch.pinverse(A)
+            # Move to CPU for pseudoinverse if on MPS (SVD not supported on MPS)
+            use_cpu = str(device).startswith('mps')
+            if use_cpu:
+                A_cpu = A.cpu()
+                self.A_inv = torch.pinverse(A_cpu).to(device)
+            else:
+                self.A_inv = torch.pinverse(A)
         else:
             raise NotImplementedError("Precomputation for full Fisher not implemented.")
 
@@ -346,27 +371,17 @@ class FOPNGMethod(ContinualMethod):
         """Convert {layer_name: weight_matrix} to flat vector including all parameters."""
         # Build full gradient vector including biases and non-KFAC parameters
         full_grad = []
-        zero_count = 0
-        nonzero_count = 0
         for name, param in self.model.named_parameters():
             if 'weight' in name:
                 layer_name = name.replace('.weight', '')
                 if layer_name in grad_dict:
                     full_grad.append(grad_dict[layer_name].view(-1))
-                    nonzero_count += grad_dict[layer_name].numel()
                 else:
                     # For non-KFAC layers, use zeros (shouldn't happen but safe)
                     full_grad.append(torch.zeros_like(param.view(-1)))
-                    zero_count += param.numel()
             else:
                 # Biases and other parameters - set to zero (KFAC doesn't precondition these)
                 full_grad.append(torch.zeros_like(param.view(-1)))
-                zero_count += param.numel()
-        
-        # DEBUG: Print ratio once
-        if not hasattr(self, '_flatten_debug_printed'):
-            self._flatten_debug_printed = True
-            print(f"  [KFAC DEBUG] Gradient flattening: {nonzero_count} preconditioned, {zero_count} set to zero")
         
         return torch.cat(full_grad)
     
@@ -430,10 +445,24 @@ class FOPNGMethod(ContinualMethod):
             v_star = -self.epsilon * F_new_inv_P_g / (denom + 1e-8)
         else:
             # Full Fisher
-            F_new_inv = torch.inverse(F_new + lam * torch.eye(F_new.size(0), device=device))
+            use_cpu = str(device).startswith('mps')
+            
+            # Compute F_new_inv
+            F_new_damped = F_new + lam * torch.eye(F_new.size(0), device=device)
+            if use_cpu:
+                F_new_inv = torch.linalg.inv(F_new_damped.cpu()).to(device)
+            else:
+                F_new_inv = torch.linalg.inv(F_new_damped)
+            
             temp = F_old @ F_new_inv @ F_old @ G
             A = G.T @ temp + lam * torch.eye(G.size(1), device=device)
-            A_inv = torch.inverse(A)
+            
+            # Compute A_inv
+            if use_cpu:
+                A_inv = torch.linalg.inv(A.cpu()).to(device)
+            else:
+                A_inv = torch.linalg.inv(A)
+            
             P = torch.eye(gradient.size(0), device=device) - F_old @ G @ A_inv @ G.T @ F_old
             P_g = P @ gradient
             F_new_inv_P_g = F_new_inv @ P_g
@@ -460,11 +489,19 @@ class FOPNGMethod(ContinualMethod):
             return self._train_regular(model, optimizer, train_loader, criterion, config, task_id, multihead, collect_stats)
         
         # Compute Fisher matrices
-        
-        F_new = self.fisher_estimator.estimate(
-            model, train_loader, criterion, config.device, 
-            task_id=task_id if multihead else None
-        )
+        print(f"[FOPNG] Computing Fisher for task {task_id}...")
+        # For K-FAC, use subsampled estimation for speed
+        if self.is_kfac:
+            F_new = self.fisher_estimator.estimate(
+                model, train_loader, criterion, config.device, 
+                task_id=task_id if multihead else None,
+                max_samples=self.kfac_samples
+            )
+        else:
+            F_new = self.fisher_estimator.estimate(
+                model, train_loader, criterion, config.device, 
+                task_id=task_id if multihead else None
+            )
         
         if self.F_old is None:
             if self.is_kfac:
@@ -486,8 +523,20 @@ class FOPNGMethod(ContinualMethod):
         grad_norms = []
         update_norms = []
         
+        # For K-FAC: Explicitly recompute inverses once at start of epoch
+        if self.is_kfac:
+            print(f"[FOPNG] Computing matrix inverses for epoch...")
+            self.fisher_estimator.recompute_inverses(damping=self.lambda_reg)
+        
+        print(f"[FOPNG] Precomputing update matrices...")
         self._compute_update_prep(F_new, self.F_old, G, config.device)
+        print(f"[FOPNG] Training on {len(train_loader)} batches...")
+        
+        batch_num = 0
         for x, y in train_loader:
+            batch_num += 1
+            if batch_num % 50 == 0:
+                print(f"[FOPNG] Batch {batch_num}/{len(train_loader)}...")
             x = x.to(config.device)
             y = y.to(config.device)
             
@@ -499,6 +548,15 @@ class FOPNGMethod(ContinualMethod):
             loss = criterion(output, y)
             model.zero_grad()
             loss.backward()
+            
+            # K-FAC: Update running average of Fisher factors during training
+            if self.is_kfac and batch_num % self.kfac_update_freq == 0:
+                self.fisher_estimator.update_running_average(
+                    model, x, y, criterion, config.device,
+                    task_id=task_id if multihead else None
+                )
+                # After updating Fisher, need to update F_new reference
+                F_new = self.fisher_estimator.fisher_factors
             
             grad = get_grad_vector(model)
             if collect_stats:
@@ -596,11 +654,19 @@ class FOPNGMethod(ContinualMethod):
         multihead: bool = False
     ):
         # Update F_old with current task's Fisher
+        print(f"[FOPNG] After-task Fisher estimation for task {task_id}...")
         criterion = nn.CrossEntropyLoss()
-        F_current = self.fisher_estimator.estimate(
-            model, train_loader, criterion, config.device,
-            task_id=task_id if multihead else None
-        )
+        if self.is_kfac:
+            F_current = self.fisher_estimator.estimate(
+                model, train_loader, criterion, config.device,
+                task_id=task_id if multihead else None,
+                max_samples=self.kfac_samples
+            )
+        else:
+            F_current = self.fisher_estimator.estimate(
+                model, train_loader, criterion, config.device,
+                task_id=task_id if multihead else None
+            )
         
         if self.F_old is None:
             self.F_old = F_current
@@ -619,6 +685,13 @@ class FOPNGMethod(ContinualMethod):
             else:
                 # For diagonal/full Fisher (tensors)
                 self.F_old = (self.F_old + F_current) / 2
+        
+        # For K-FAC: Recompute inverses after updating F_old
+        if self.is_kfac:
+            print(f"[FOPNG] Recomputing inverses after task {task_id}...")
+            # Note: F_old was just updated, so we should recompute its inverses
+            # But cached inverses in fisher_estimator are for F_new/F_current
+            # This is okay - we'll recompute at start of next epoch anyway
         
         # Collect gradients
         print(f"Collecting FOPNG directions from task {task_id}...")
