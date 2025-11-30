@@ -4,7 +4,7 @@ import numpy as np
 from dataclasses import dataclass
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List, Union
 from tqdm import tqdm
 
 from config import Config
@@ -154,6 +154,9 @@ class OGDMethod(ContinualMethod):
         raw_grad_norms = []
         proj_grad_norms = []
         proj_to_raw_ratios = []
+        projection_relative_changes = []
+        
+        num_directions = len(self.memory)
         
         iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
         
@@ -177,15 +180,22 @@ class OGDMethod(ContinualMethod):
             raw_grad_norms.append(raw_norm)
             
             # Project gradient if we have stored directions
-            if len(self.memory) > 0:
+            if num_directions > 0:
                 g_tilde = self.memory.project_orthogonal(g)
                 proj_norm = g_tilde.norm().item()
                 proj_grad_norms.append(proj_norm)
                 proj_to_raw_ratios.append(proj_norm / (raw_norm + 1e-8))
+                
+                # Compute relative change from projection
+                diff_norm = (g - g_tilde).norm().item()
+                relative_change = diff_norm / (raw_norm + 1e-10)
+                projection_relative_changes.append(relative_change)
+                
                 set_grad_vector(model, g_tilde)
             else:
                 proj_grad_norms.append(raw_norm)  # No projection, same as raw
                 proj_to_raw_ratios.append(1.0)  # Ratio is 1 when no projection
+                projection_relative_changes.append(0.0)  # No change when no projection
             
             optimizer.step()
             
@@ -194,13 +204,21 @@ class OGDMethod(ContinualMethod):
             total_correct += (preds == y).sum().item()
             total_samples += x.size(0)
         
-        # Log average gradient norms and ratios for this epoch (task-specific plots)
-        log({
-            f"grad_norms_task_{task_id}/ogd_raw_gradient": np.mean(raw_grad_norms),
-            f"grad_norms_task_{task_id}/ogd_projected_gradient": np.mean(proj_grad_norms),
-            f"grad_ratios_task_{task_id}/ogd_projected_to_raw": np.mean(proj_to_raw_ratios),
+        # Log comprehensive OGD metrics
+        log_metrics = {
             "task_id": task_id,
-        })
+            "ogd_gradients/raw_grad_norm_mean": np.mean(raw_grad_norms),
+            "ogd_gradients/raw_grad_norm_std": np.std(raw_grad_norms),
+            "ogd_gradients/projected_grad_norm_mean": np.mean(proj_grad_norms),
+            "ogd_gradients/projected_grad_norm_std": np.std(proj_grad_norms),
+            "ogd_gradients/projected_to_raw_ratio_mean": np.mean(proj_to_raw_ratios),
+            "ogd_gradients/projected_to_raw_ratio_std": np.std(proj_to_raw_ratios),
+            "ogd_gradients/projection_relative_change_mean": np.mean(projection_relative_changes),
+            "ogd_gradients/projection_relative_change_std": np.std(projection_relative_changes),
+            "ogd_gradients/num_directions": num_directions,
+        }
+        
+        log(log_metrics)
         
         return total_loss / total_samples, total_correct / total_samples
     
@@ -240,6 +258,7 @@ class FOPNGMethod(ContinualMethod):
     ):
         self.fisher_estimator = fisher_estimator or DiagonalFisherEstimator()
         self.collector = collector or AVECollector()
+        # Change memory mode to 'orthonormal' to force normalization
         self.memory = GradientMemory(mode='raw', max_directions=max_directions)
         self.F_old: Optional[torch.Tensor] = None
         self.is_diagonal = isinstance(self.fisher_estimator, DiagonalFisherEstimator)
@@ -321,6 +340,8 @@ class FOPNGMethod(ContinualMethod):
                 self.A_inv = torch.pinverse(A_cpu).to(device)
             else:
                 self.A_inv = torch.pinverse(A)
+            # Also store A for condition number check
+            self.A = A
         else:
             raise NotImplementedError("Precomputation for full Fisher not implemented.")
 
@@ -366,15 +387,26 @@ class FOPNGMethod(ContinualMethod):
         F_old: torch.Tensor,
         G: torch.Tensor,
         device: str,
-        lr: float
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Compute FOPNG update step.
+        lr: float,
+        return_intermediate: bool = True
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, float]]]:
+        """
+        Compute FOPNG update step.
         
-        Returns:
-            Tuple of (update vector, dict of norms and ratios for logging)
+        If return_intermediate=True, returns (update, stats_dict) where stats_dict contains:
+        - raw_grad_norm: ||g||
+        - fisher_grad_norm: ||F_old^{1/2} * g|| (gradient in Fisher space)
+        - correction_norm: ||correction||
+        - projected_grad_eucl_norm: ||P_g|| (projected gradient in Euclidean space)
+        - projected_grad_fisher_norm: ||F_old^{1/2} * P_g|| (projected gradient in Fisher space)
+        - update_norm: ||v_star|| (final update)
+        - projection_relative_change: ||g - P_g|| / ||g||
+        - fisher_projection_relative_change: ||F_old^{1/2} * (g - P_g)|| / ||F_old^{1/2} * g||
+        - correction_to_raw_ratio: ||correction|| / ||g||
+        - update_to_raw_ratio: ||v_star|| / ||g||
         """
         lam = self.lambda_reg
-        norms = {}
+        stats = {}
 
         if self.is_kfac:
             # KFAC-based FOPNG: Same structure as diagonal, but using KFAC operations
@@ -412,40 +444,143 @@ class FOPNGMethod(ContinualMethod):
             denom = torch.sqrt((P_g * F_new_inv_P_g).sum() + 1e-8)
             v_star = -lr * F_new_inv_P_g / (denom + 1e-8)
             
-            # Compute norms and ratios for logging
-            raw_norm = gradient.norm().item()
-            correction_norm = correction.norm().item()
-            v_star_norm = v_star.norm().item()
-            
-            norms['raw_gradient'] = raw_norm
-            norms['correction'] = correction_norm
-            norms['v_star'] = v_star_norm
-            norms['correction_to_raw_ratio'] = correction_norm / (raw_norm + 1e-8)
-            norms['v_star_to_raw_ratio'] = v_star_norm / (raw_norm + 1e-8)
+            if return_intermediate:
+                # Compute comprehensive statistics (same structure as diagonal)
+                raw_norm = gradient.norm().item()
+                fisher_norm = F_old_g.norm().item()  # Use F_old @ g as "Fisher space" analog
+                correction_norm = correction.norm().item()
+                P_g_eucl_norm = P_g.norm().item()
+                v_star_norm = v_star.norm().item()
+                
+                # Relative changes
+                diff_eucl = (gradient - P_g).norm().item()
+                projection_relative_change = diff_eucl / (raw_norm + 1e-10)
+                
+                stats.update({
+                    'raw_grad_norm': raw_norm,
+                    'fisher_grad_norm': fisher_norm,
+                    'correction_norm': correction_norm,
+                    'projected_grad_eucl_norm': P_g_eucl_norm,
+                    'projected_grad_fisher_norm': 0.0,  # Not computed for KFAC
+                    'update_norm': v_star_norm,
+                    'projection_relative_change': projection_relative_change,
+                    'fisher_projection_relative_change': 0.0,  # Not computed for KFAC
+                    'correction_to_raw_ratio': correction_norm / (raw_norm + 1e-10),
+                    'update_to_raw_ratio': v_star_norm / (raw_norm + 1e-10),
+                    'projected_to_raw_ratio_eucl': P_g_eucl_norm / (raw_norm + 1e-10),
+                    'projected_to_raw_ratio_fisher': 0.0,  # Not computed for KFAC
+                })
         elif self.is_diagonal:
+            # Transform to Fisher space: g_F = F_old^{1/2} * g
+            F_old_sqrt = torch.sqrt(F_old + 1e-10)
+            g_fisher = F_old_sqrt * gradient
+            
             F_new_inv_diag = 1.0 / (F_new + lam)
+            
+            # Original projection logic
             F_old_g = F_old * gradient
             G_T_F_old_g = G.T @ F_old_g
             A_inv_G_T_F_old_g = self.A_inv @ G_T_F_old_g
             correction = (G @ A_inv_G_T_F_old_g).view(-1) * F_old.squeeze()
             P_g = gradient - correction
+
+            if return_intermediate:
+                # --- DIAGNOSTICS FOR CORRECTION ---
+                # Calculate norms for pipeline steps
+                step1_norm = F_old_g.norm().item()
+                step2_norm = G_T_F_old_g.norm().item()
+                step3_norm = A_inv_G_T_F_old_g.norm().item()
+                correction_unweighted = (G @ A_inv_G_T_F_old_g).view(-1)
+                step4_norm = correction_unweighted.norm().item()
+                step5_norm = correction.norm().item()
+                grad_norm = gradient.norm().item()
+                
+                # Calculate matrix properties
+                g_norm = G.norm().item()
+                dim = G.shape[0]
+                g_normalized = g_norm / (np.sqrt(dim) + 1e-10)
+                
+                # Calculate A matrix conditioning
+                a_norm = torch.norm(self.A).item()
+                a_inv_norm = torch.norm(self.A_inv).item()
+                a_cond = torch.linalg.cond(self.A).item()
+
+                # Ratios
+                ratio1 = step1_norm / (grad_norm + 1e-10)
+                ratio2 = step2_norm / (step1_norm + 1e-10)
+                ratio3 = step3_norm / (step2_norm + 1e-10)
+                ratio4 = step4_norm / (step3_norm + 1e-10)
+                ratio5 = step5_norm / (step4_norm + 1e-10)
+
+                stats.update({
+                    'correction/step1_norm_F_old_g': step1_norm,
+                    'correction/step2_norm_G_T_F_old_g': step2_norm,
+                    'correction/step3_norm_A_inv_G_T': step3_norm,
+                    'correction/step4_norm_correction_unweighted': step4_norm,
+                    'correction/step5_norm_correction_final': step5_norm,
+                    
+                    'correction/ratio1_Fold_g_vs_g': ratio1,
+                    'correction/ratio2_proj_vs_Fold_g': ratio2,
+                    'correction/ratio3_Ainv_vs_proj': ratio3,
+                    'correction/ratio4_unweighted_vs_Ainv': ratio4,
+                    'correction/ratio5_final_vs_unweighted': ratio5,
+                    
+                    'correction/G_norm_normalized': g_normalized,
+                    'correction/G_abs_mean': G.abs().mean().item(),
+                    'correction/A_condition_number': a_cond,
+                    'correction/A_norm': a_norm,
+                    'correction/A_inv_norm': a_inv_norm,
+                    
+                    'correction/lambda_ratio_Fold': F_old.norm().item() / (lam + 1e-10),
+                })
+            
+            # Projected gradient in Fisher space: F_old^{1/2} * P_g
+            P_g_fisher = F_old_sqrt * P_g
+            
             F_new_inv_P_g = P_g * F_new_inv_diag
             denom = torch.sqrt((P_g * F_new_inv_P_g).sum() + 1e-8)
             v_star = -lr * F_new_inv_P_g / (denom + 1e-8)
             
-            # Compute norms and ratios for logging
-            raw_norm = gradient.norm().item()
-            correction_norm = correction.norm().item()
-            v_star_norm = v_star.norm().item()
-            
-            norms['raw_gradient'] = raw_norm
-            norms['correction'] = correction_norm
-            norms['v_star'] = v_star_norm
-            norms['correction_to_raw_ratio'] = correction_norm / (raw_norm + 1e-8)
-            norms['v_star_to_raw_ratio'] = v_star_norm / (raw_norm + 1e-8)
+            if return_intermediate:
+                # Compute comprehensive statistics
+                raw_norm = gradient.norm().item()
+                fisher_norm = g_fisher.norm().item()
+                correction_norm = correction.norm().item()
+                P_g_eucl_norm = P_g.norm().item()
+                P_g_fisher_norm = P_g_fisher.norm().item()
+                v_star_norm = v_star.norm().item()
+                
+                # Relative changes
+                diff_eucl = (gradient - P_g).norm().item()
+                diff_fisher = (g_fisher - P_g_fisher).norm().item()
+                projection_relative_change = diff_eucl / (raw_norm + 1e-10)
+                fisher_projection_relative_change = diff_fisher / (fisher_norm + 1e-10)
+                
+                stats.update({
+                    'raw_grad_norm': raw_norm,
+                    'fisher_grad_norm': fisher_norm,
+                    'correction_norm': correction_norm,
+                    'projected_grad_eucl_norm': P_g_eucl_norm,
+                    'projected_grad_fisher_norm': P_g_fisher_norm,
+                    'update_norm': v_star_norm,
+                    'projection_relative_change': projection_relative_change,
+                    'fisher_projection_relative_change': fisher_projection_relative_change,
+                    'correction_to_raw_ratio': correction_norm / (raw_norm + 1e-10),
+                    'update_to_raw_ratio': v_star_norm / (raw_norm + 1e-10),
+                    'projected_to_raw_ratio_eucl': P_g_eucl_norm / (raw_norm + 1e-10),
+                    'projected_to_raw_ratio_fisher': P_g_fisher_norm / (fisher_norm + 1e-10),
+                })
         else:
             # Full Fisher
             use_cpu = str(device).startswith('mps')
+            
+            # Transform to Fisher space
+            F_old_damped = F_old + lam * torch.eye(F_old.size(0), device=device)
+            if use_cpu:
+                F_old_sqrt = torch.linalg.cholesky(F_old_damped.cpu()).to(device)
+            else:
+                F_old_sqrt = torch.linalg.cholesky(F_old_damped)
+            g_fisher = F_old_sqrt @ gradient
             
             # Compute F_new_inv
             F_new_damped = F_new + lam * torch.eye(F_new.size(0), device=device)
@@ -465,22 +600,48 @@ class FOPNGMethod(ContinualMethod):
             
             P = torch.eye(gradient.size(0), device=device) - F_old @ G @ A_inv @ G.T @ F_old
             P_g = P @ gradient
+            
+            # Projected gradient in Fisher space
+            P_g_fisher = F_old_sqrt @ P_g
+            
             F_new_inv_P_g = F_new_inv @ P_g
             denom = torch.sqrt(P_g @ F_new_inv_P_g + 1e-8)
             v_star = -lr * F_new_inv_P_g / denom
             
-            # Compute norms and ratios for logging
-            raw_norm = gradient.norm().item()
-            correction_norm = correction.norm().item()
-            v_star_norm = v_star.norm().item()
-            
-            norms['raw_gradient'] = raw_norm
-            norms['correction'] = correction_norm
-            norms['v_star'] = v_star_norm
-            norms['correction_to_raw_ratio'] = correction_norm / (raw_norm + 1e-8)
-            norms['v_star_to_raw_ratio'] = v_star_norm / (raw_norm + 1e-8)
+            if return_intermediate:
+                # Compute comprehensive statistics
+                raw_norm = gradient.norm().item()
+                fisher_norm = g_fisher.norm().item()
+                correction = gradient - P_g
+                correction_norm = correction.norm().item()
+                P_g_eucl_norm = P_g.norm().item()
+                P_g_fisher_norm = P_g_fisher.norm().item()
+                v_star_norm = v_star.norm().item()
+                
+                # Relative changes
+                diff_eucl = correction_norm
+                diff_fisher = (g_fisher - P_g_fisher).norm().item()
+                projection_relative_change = diff_eucl / (raw_norm + 1e-10)
+                fisher_projection_relative_change = diff_fisher / (fisher_norm + 1e-10)
+                
+                stats.update({
+                    'raw_grad_norm': raw_norm,
+                    'fisher_grad_norm': fisher_norm,
+                    'correction_norm': correction_norm,
+                    'projected_grad_eucl_norm': P_g_eucl_norm,
+                    'projected_grad_fisher_norm': P_g_fisher_norm,
+                    'update_norm': v_star_norm,
+                    'projection_relative_change': projection_relative_change,
+                    'fisher_projection_relative_change': fisher_projection_relative_change,
+                    'correction_to_raw_ratio': correction_norm / (raw_norm + 1e-10),
+                    'update_to_raw_ratio': v_star_norm / (raw_norm + 1e-10),
+                    'projected_to_raw_ratio_eucl': P_g_eucl_norm / (raw_norm + 1e-10),
+                    'projected_to_raw_ratio_fisher': P_g_fisher_norm / (fisher_norm + 1e-10),
+                })
         
-        return v_star, norms
+        if return_intermediate:
+            return v_star, stats
+        return v_star
     
     def train_epoch(
         self,
@@ -525,6 +686,50 @@ class FOPNGMethod(ContinualMethod):
             else:
                 self.F_old = F_new.clone()
         
+        # Log Fisher matrix properties (computed once per epoch)
+        if self.is_kfac:
+            # For KFAC, compute aggregate norm across all layer factors
+            fisher_new_norm = sum(
+                F_new[name]['A'].norm().item() + F_new[name]['G'].norm().item() 
+                for name in F_new
+            )
+            fisher_old_norm = sum(
+                self.F_old[name]['A'].norm().item() + self.F_old[name]['G'].norm().item() 
+                for name in self.F_old
+            )
+            fisher_diff_norm = sum(
+                (F_new[name]['A'] - self.F_old[name]['A']).norm().item() + 
+                (F_new[name]['G'] - self.F_old[name]['G']).norm().item()
+                for name in F_new if name in self.F_old
+            )
+            fisher_relative_diff = fisher_diff_norm / (fisher_old_norm + 1e-10)
+            fisher_new_trace = None
+            fisher_old_trace = None
+            fisher_trace_diff = None
+            fisher_trace_relative_diff = None
+        elif self.is_diagonal:
+            fisher_new_norm = F_new.norm().item()
+            fisher_old_norm = self.F_old.norm().item()
+            fisher_diff_norm = (F_new - self.F_old).norm().item()
+            fisher_relative_diff = fisher_diff_norm / (fisher_old_norm + 1e-10)
+            fisher_new_trace = F_new.sum().item()
+            fisher_old_trace = self.F_old.sum().item()
+            fisher_trace_diff = abs(fisher_new_trace - fisher_old_trace)
+            fisher_trace_relative_diff = fisher_trace_diff / (abs(fisher_old_trace) + 1e-10)
+        else:
+            # Full Fisher
+            fisher_new_norm = F_new.norm().item()
+            fisher_old_norm = self.F_old.norm().item()
+            fisher_diff_norm = (F_new - self.F_old).norm().item()
+            fisher_relative_diff = fisher_diff_norm / (fisher_old_norm + 1e-10)
+            fisher_new_trace = torch.trace(F_new).item() if F_new.dim() == 2 else None
+            fisher_old_trace = torch.trace(self.F_old).item() if self.F_old.dim() == 2 else None
+            fisher_trace_diff = abs(fisher_new_trace - fisher_old_trace) if fisher_new_trace is not None else None
+            fisher_trace_relative_diff = fisher_trace_diff / (abs(fisher_old_trace) + 1e-10) if fisher_old_trace is not None else None
+        
+        # Log number of stored gradient directions
+        num_directions = G.size(1) if G is not None else 0
+        
         model.train()
         total_loss = 0.0
         total_correct = 0
@@ -540,12 +745,41 @@ class FOPNGMethod(ContinualMethod):
         
         iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
         
-        # Accumulators for gradient norms and ratios (log average per epoch)
-        raw_grad_norms = []
-        correction_norms = []
-        v_star_norms = []
-        correction_to_raw_ratios = []
-        v_star_to_raw_ratios = []
+        # Accumulators for all metrics (log average per epoch)
+        batch_stats = {
+            'raw_grad_norm': [],
+            'fisher_grad_norm': [],
+            'correction_norm': [],
+            'projected_grad_eucl_norm': [],
+            'projected_grad_fisher_norm': [],
+            'update_norm': [],
+            'projection_relative_change': [],
+            'fisher_projection_relative_change': [],
+            'correction_to_raw_ratio': [],
+            'update_to_raw_ratio': [],
+            'projected_to_raw_ratio_eucl': [],
+            'projected_to_raw_ratio_fisher': [],
+            
+            # New diagnostics
+            'correction/step1_norm_F_old_g': [],
+            'correction/step2_norm_G_T_F_old_g': [],
+            'correction/step3_norm_A_inv_G_T': [],
+            'correction/step4_norm_correction_unweighted': [],
+            'correction/step5_norm_correction_final': [],
+            
+            'correction/ratio1_Fold_g_vs_g': [],
+            'correction/ratio2_proj_vs_Fold_g': [],
+            'correction/ratio3_Ainv_vs_proj': [],
+            'correction/ratio4_unweighted_vs_Ainv': [],
+            'correction/ratio5_final_vs_unweighted': [],
+            
+            'correction/G_norm_normalized': [],
+            'correction/G_abs_mean': [],
+            'correction/A_condition_number': [],
+            'correction/A_norm': [],
+            'correction/A_inv_norm': [],
+            'correction/lambda_ratio_Fold': [],
+        }
         
         batch_num = 0
         for x, y in iterator:
@@ -572,30 +806,55 @@ class FOPNGMethod(ContinualMethod):
                 F_new = self.fisher_estimator.fisher_factors
             
             grad = get_grad_vector(model)
-            update, norms = self._compute_update(grad, F_new, self.F_old, G, config.device, config.lr)
+            update, stats = self._compute_update(grad, F_new, self.F_old, G, config.device, config.lr, return_intermediate=True)
             apply_update(model, update)
             
-            # Accumulate norms and ratios
-            raw_grad_norms.append(norms['raw_gradient'])
-            correction_norms.append(norms['correction'])
-            v_star_norms.append(norms['v_star'])
-            correction_to_raw_ratios.append(norms['correction_to_raw_ratio'])
-            v_star_to_raw_ratios.append(norms['v_star_to_raw_ratio'])
+            # Accumulate all statistics
+            for key in batch_stats.keys():
+                if key in stats:
+                    batch_stats[key].append(stats[key])
             
             total_loss += loss.item() * x.size(0)
             preds = output.argmax(dim=1)
             total_correct += (preds == y).sum().item()
             total_samples += x.size(0)
         
-        # Log average gradient norms and ratios for this epoch (task-specific plots)
-        log({
-            f"grad_norms_task_{task_id}/fopng_raw_gradient": np.mean(raw_grad_norms),
-            f"grad_norms_task_{task_id}/fopng_correction": np.mean(correction_norms),
-            f"grad_norms_task_{task_id}/fopng_v_star": np.mean(v_star_norms),
-            f"grad_ratios_task_{task_id}/fopng_correction_to_raw": np.mean(correction_to_raw_ratios),
-            f"grad_ratios_task_{task_id}/fopng_v_star_to_raw": np.mean(v_star_to_raw_ratios),
+        # Compute means for all metrics
+        log_metrics = {
             "task_id": task_id,
+        }
+        
+        # Fisher matrix metrics (per epoch)
+        log_metrics.update({
+            f"fisher_matrix/fisher_new_norm": fisher_new_norm,
+            f"fisher_matrix/fisher_old_norm": fisher_old_norm,
+            f"fisher_matrix/fisher_diff_norm": fisher_diff_norm,
+            f"fisher_matrix/fisher_relative_diff": fisher_relative_diff,
+            f"fisher_matrix/num_directions": num_directions,
         })
+        
+        if fisher_new_trace is not None:
+            log_metrics.update({
+                f"fisher_matrix/fisher_new_trace": fisher_new_trace,
+                f"fisher_matrix/fisher_old_trace": fisher_old_trace,
+                f"fisher_matrix/fisher_trace_diff": fisher_trace_diff,
+                f"fisher_matrix/fisher_trace_relative_diff": fisher_trace_relative_diff,
+            })
+        
+        # Gradient and update metrics (averaged over batches in epoch)
+        for key, values in batch_stats.items():
+            if values:
+                if key.startswith('correction/'):
+                    # Log correction metrics directly under correction/
+                    log_metrics[f"{key}_mean"] = np.mean(values)
+                    log_metrics[f"{key}_std"] = np.std(values)
+                else:
+                    # Log other gradients under fopng_gradients/
+                    log_metrics[f"fopng_gradients/{key}_mean"] = np.mean(values)
+                    log_metrics[f"fopng_gradients/{key}_std"] = np.std(values)
+        
+        # Log all metrics to wandb
+        log(log_metrics)
         
         return total_loss / total_samples, total_correct / total_samples
     
@@ -646,13 +905,10 @@ class FOPNGMethod(ContinualMethod):
             total_correct += (preds == y).sum().item()
             total_samples += x.size(0)
         
-        # Log average gradient norms for this epoch (task-specific plots, no correction/v_star for task 0)
+        # Log average gradient norms for this epoch (task 0, no FOPNG projection)
         log({
-            f"grad_norms_task_{task_id}/fopng_raw_gradient": np.mean(raw_grad_norms),
-            f"grad_norms_task_{task_id}/fopng_correction": 0.0,  # No correction for task 0
-            f"grad_norms_task_{task_id}/fopng_v_star": 0.0,  # No v_star for task 0
-            f"grad_ratios_task_{task_id}/fopng_correction_to_raw": 0.0,  # No correction for task 0
-            f"grad_ratios_task_{task_id}/fopng_v_star_to_raw": 0.0,  # No v_star for task 0
+            f"fopng_gradients/raw_grad_norm_mean": np.mean(raw_grad_norms),
+            f"fopng_gradients/raw_grad_norm_std": np.std(raw_grad_norms),
             "task_id": task_id,
         })
         

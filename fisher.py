@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional
 import torch
+import torch.nn.functional as F
+from torch.func import functional_call, vmap, grad
 from torch import nn
 from torch.utils.data import DataLoader
 import numpy as np
@@ -24,7 +26,16 @@ class FisherEstimator(ABC):
 
 
 class DiagonalFisherEstimator(FisherEstimator):
-    """Diagonal approximation of the empirical Fisher."""
+    """
+    True empirical Fisher: average of per-sample squared gradients.
+    
+    Args:
+        use_vmap: If True, use vmap for parallel per-sample gradients (faster but memory-intensive).
+                  If False (default), use sequential loop (slower but memory-efficient).
+    """
+    
+    def __init__(self, use_vmap: bool = False):
+        self.use_vmap = use_vmap
     
     def estimate(
         self,
@@ -34,27 +45,107 @@ class DiagonalFisherEstimator(FisherEstimator):
         device: str,
         task_id: Optional[int] = None
     ) -> torch.Tensor:
-        fisher = {n: torch.zeros_like(p) for n, p in model.named_parameters()}
         model.eval()
         
-        for data, target in dataloader:
-            data, target = data.to(device), target.to(device)
-            model.zero_grad()
-            if task_id is not None:
-                output = model(data, task_id=task_id)
-            else:
-                output = model(data)
-            loss = criterion(output, target)
-            loss.backward()
-            
-            for n, p in model.named_parameters():
-                if p.grad is not None:
-                    fisher[n] += p.grad.data.clone() ** 2
+        # Clear GPU cache before Fisher estimation to free up memory
+        if device.startswith('cuda'):
+            torch.cuda.empty_cache()
         
+        if self.use_vmap:
+            return self._estimate_vmap(model, dataloader, criterion, device)
+        else:
+            return self._estimate_sequential(model, dataloader, criterion, device)
+    
+    def _estimate_sequential(
+        self,
+        model: nn.Module,
+        dataloader: DataLoader,
+        criterion: nn.Module,
+        device: str
+    ) -> torch.Tensor:
+        """Memory-efficient sequential per-sample gradient computation."""
+        fisher = {n: torch.zeros_like(p) for n, p in model.named_parameters()}
+        total_samples = 0
+        
+        from tqdm import tqdm
+        iterator = tqdm(dataloader, desc="Estimating Fisher", leave=False)
+        
+        for data, target in iterator:
+            data, target = data.to(device), target.to(device)
+            
+            # Per-sample loop
+            for i in range(data.size(0)):
+                model.zero_grad()
+                output = model(data[i:i+1])
+                loss = criterion(output, target[i:i+1])
+                loss.backward()
+                
+                for n, p in model.named_parameters():
+                    if p.grad is not None:
+                        fisher[n] += p.grad.data ** 2
+                
+                total_samples += 1
+        
+        # Average over total samples
         for n in fisher:
-            fisher[n] /= len(dataloader)
+            fisher[n] /= total_samples
         
         return torch.cat([fisher[n].view(-1) for n in fisher])
+    
+    def _estimate_vmap(
+        self,
+        model: nn.Module,
+        dataloader: DataLoader,
+        criterion: nn.Module,
+        device: str
+    ) -> torch.Tensor:
+        """Fast vmap-based per-sample gradient computation (memory-intensive)."""
+        # Prepare functional parameters
+        params = {name: p for name, p in model.named_parameters()}
+        buffers = dict(model.named_buffers())
+
+        # Initialize accumulator
+        fisher = {name: torch.zeros_like(p, device=device) 
+                  for name, p in params.items()}
+        
+        total_samples = 0
+
+        # Define a pure function for loss on a SINGLE sample
+        def compute_loss_stateless(params, buffers, x, y):
+            x_batch = x.unsqueeze(0)
+            out = functional_call(model, (params, buffers), (x_batch,))
+            out = out.squeeze(0)
+            y_batch = y.unsqueeze(0) if y.dim() == 0 else y.unsqueeze(0)
+            
+            if isinstance(criterion, nn.CrossEntropyLoss):
+                 loss = F.cross_entropy(out.unsqueeze(0), y_batch)
+            else:
+                 loss = criterion(out.unsqueeze(0), y_batch)
+            
+            return loss
+
+        grad_fn = grad(compute_loss_stateless)
+
+        from tqdm import tqdm
+        iterator = tqdm(dataloader, desc="Estimating Fisher (vmap)", leave=False)
+
+        for x, y in iterator:
+            x, y = x.to(device), y.to(device)
+            batch_size = x.size(0)
+            total_samples += batch_size
+
+            # Use vmap to compute per-sample gradients in parallel
+            batch_grads = vmap(grad_fn, in_dims=(None, None, 0, 0))(params, buffers, x, y)
+
+            # Accumulate squared gradients
+            for name, g in batch_grads.items():
+                fisher[name] += (g ** 2).sum(dim=0)
+
+        # Divide by N to get the average
+        for name in fisher:
+            fisher[name] /= total_samples
+
+        return torch.cat([fisher[n].reshape(-1) for n in fisher])
 
 
 class FullFisherEstimator(FisherEstimator):
@@ -68,9 +159,14 @@ class FullFisherEstimator(FisherEstimator):
         device: str,
         task_id: Optional[int] = None
     ) -> torch.Tensor:
+        model.eval()
+        
+        # Clear GPU cache before Fisher estimation to free up memory
+        if device.startswith('cuda'):
+            torch.cuda.empty_cache()
+        
         p = get_param_count(model)
         fisher = torch.zeros(p, p, device=device)
-        model.eval()
         n_samples = 0
         
         for data, target in dataloader:
