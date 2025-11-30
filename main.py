@@ -522,7 +522,9 @@ def main():
     parser.add_argument("--fisher", type=str, default="diagonal",
                         choices=["diagonal", "full"])
 
-    parser.add_argument("--max_directions", type=int, default=200)
+    parser.add_argument("--max_directions", type=int, default=2000)
+    parser.add_argument("--grads_per_task", type=int, default=200,
+                        help="Number of gradient directions to collect per task for OGD/FOPNG")
 
     # FOPNG-specific
     parser.add_argument("--fopng_lambda_reg", type=float, default=0.0,
@@ -561,7 +563,7 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
         epochs_per_task=args.epochs,
-        grads_per_task=200,
+        grads_per_task=args.grads_per_task,
         device=args.device,
 
         # Logging
