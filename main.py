@@ -18,7 +18,7 @@ from datasets import (
     build_split_cifar10_tasks,
     build_split_cifar100_tasks,
 )
-from optimizers import ContinualMethod, SGDMethod, OGDMethod, FOPNGMethod, FNGMethod, AVECollector
+from optimizers import ContinualMethod, SGDMethod, AdamMethod, OGDMethod, FOPNGMethod, FNGMethod, AVECollector
 from gradients import GTLCollector, GradientCollector
 from fisher import DiagonalFisherEstimator, FullFisherEstimator, FisherEstimator, fisher_norm_distance
 from utils import set_seed, evaluate
@@ -441,6 +441,8 @@ def _create_method(method_name: str, **kwargs) -> ContinualMethod:
     
     if method_name == 'sgd':
         return SGDMethod()
+    elif method_name == 'adam':
+        return AdamMethod()
     elif method_name == 'ogd':
         collector = _get_collector(kwargs.get('collector', 'gtl'))
         max_dirs = kwargs.get('max_directions', 2000)

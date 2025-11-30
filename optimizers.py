@@ -116,6 +116,62 @@ class SGDMethod(ContinualMethod):
     ):
         pass
 
+class AdamMethod(ContinualMethod):
+    """Vanilla Adam baseline (no continual learning)."""
+    
+    def setup(self, model: nn.Module, config: Config):
+        pass
+    
+    def train_epoch(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        train_loader: DataLoader,
+        criterion: nn.Module,
+        config: Config,
+        task_id: int,
+        multihead: bool = False,
+        progress_desc: Optional[str] = None
+    ) -> Tuple[float, float]:
+        model.train()
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        
+        iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
+        
+        for x, y in iterator:
+            x = x.to(config.device)
+            y = y.to(config.device)
+            
+            optimizer.zero_grad()
+            
+            if multihead:
+                logits = model(x, task_id=task_id)
+            else:
+                logits = model(x)
+            
+            loss = criterion(logits, y)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item() * x.size(0)
+            preds = logits.argmax(dim=1)
+            total_correct += (preds == y).sum().item()
+            total_samples += x.size(0)
+        
+        return total_loss / total_samples, total_correct / total_samples
+    
+    def after_task(
+        self,
+        model: nn.Module,
+        train_loader: DataLoader,
+        task_id: int,
+        config: Config,
+        multihead: bool = False
+    ):
+        pass
+
 
 class OGDMethod(ContinualMethod):
     """
