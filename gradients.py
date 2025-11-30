@@ -5,6 +5,7 @@ import numpy as np
 import random
 from typing import List, Optional, Tuple
 from abc import ABC, abstractmethod
+from tqdm import tqdm
 
 def get_grad_vector(model: nn.Module) -> torch.Tensor:
     """Concatenate all parameter gradients into a single 1D tensor."""
@@ -146,7 +147,12 @@ class GTLCollector(GradientCollector):
         model.eval()
         collected = 0
         
-        for x, y in dataloader:
+        desc = "Collecting GTL gradients"
+        if task_id is not None:
+            desc += f" (task {task_id})"
+        iterator = tqdm(dataloader, desc=desc, leave=False)
+        
+        for x, y in iterator:
             x = x.to(device)
             y = y.to(device)
             
@@ -194,7 +200,12 @@ class AVECollector(GradientCollector):
         model.eval()
         collected = 0
         
-        for x, y in dataloader:
+        desc = "Collecting AVE gradients"
+        if task_id is not None:
+            desc += f" (task {task_id})"
+        iterator = tqdm(dataloader, desc=desc, leave=False)
+        
+        for x, y in iterator:
             if collected >= num_directions:
                 break
             x = x.to(device)

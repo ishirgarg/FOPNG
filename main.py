@@ -10,8 +10,14 @@ import numpy as np
 import argparse
 
 from config import Config
-from models import MLP, MultiHeadMLP
-from datasets import build_permuted_mnist_tasks, build_rotated_mnist_tasks, build_split_mnist_tasks
+from models import MLP, MultiHeadMLP, SimpleCIFARCNN, MultiHeadCIFARCNN
+from datasets import (
+    build_permuted_mnist_tasks,
+    build_rotated_mnist_tasks,
+    build_split_mnist_tasks,
+    build_split_cifar10_tasks,
+    build_split_cifar100_tasks,
+)
 from optimizers import ContinualMethod, SGDMethod, OGDMethod, FOPNGMethod, AVECollector
 from gradients import GTLCollector
 from fisher import DiagonalFisherEstimator, FullFisherEstimator, KFACFisherEstimator, fisher_norm_distance
@@ -68,12 +74,17 @@ def run_experiment(
     
     # Setup logger
     if logger is None and config.log_dir:
-        logger = ExperimentLogger(config.log_dir, config.experiment_name, config)
+        logger = ExperimentLogger(
+            config.log_dir, 
+            config.experiment_name, 
+            config,
+            project=config.wandb_project if config.use_wandb else 'fopng-experiments',
+            entity=config.wandb_entity,
+            tags=config.wandb_tags,
+        )
     
     if logger:
         logger.start_experiment(method.name, dataset_name, task_names)
-    
-    collect_stats = config.save_raw_data if hasattr(config, 'save_raw_data') else False
     
     prev_params = None
     param_distances = []
@@ -86,30 +97,26 @@ def run_experiment(
         train_loader, _ = tasks[t]
         
         for epoch in range(config.epochs_per_task):
-            result = method.train_epoch(
-                model, optimizer, train_loader, criterion, config, t, multihead, collect_stats
+            loss, acc = method.train_epoch(
+                model,
+                optimizer,
+                train_loader,
+                criterion,
+                config,
+                t,
+                multihead,
+                progress_desc=f"Task {t} Epoch {epoch+1}/{config.epochs_per_task}"
             )
-            loss, acc = result[0], result[1]
-            stats = result[2] if len(result) > 2 else None
             
             print(f"Epoch {epoch+1}/{config.epochs_per_task} | "
-                  f"Loss: {loss:.4f} | Acc: {acc*100:.2f}%", end='')
-            
-            if stats and 'grad_norm_mean' in stats:
-                print(f" | ||∇||: {stats['grad_norm_mean']:.2e}", end='')
-            print()
+                  f"Loss: {loss:.4f} | Acc: {acc*100:.2f}%")
             
             if logger:
                 logger.log_epoch(
                     task_id=t,
                     epoch=epoch + 1,
                     train_loss=loss,
-                    train_acc=acc,
-                    grad_norm_mean=stats.get('grad_norm_mean') if stats else None,
-                    grad_norm_std=stats.get('grad_norm_std') if stats else None,
-                    update_norm_mean=stats.get('update_norm_mean') if stats else None,
-                    update_norm_std=stats.get('update_norm_std') if stats else None,
-                    extra_stats=stats
+                    train_acc=acc
                 )
 
         # Compute empirical Fisher
@@ -133,6 +140,15 @@ def run_experiment(
                 'l2_distance': l2_dist
             })
             print(f"  Parameter drift: L2={l2_dist:.4f}, Fisher(train)={fisher_dist_train:.4f}, Fisher(test)={fisher_dist_test:.4f}")
+            
+            # Log parameter distances to wandb (uses global step counter)
+            from logger import log
+            log({
+                "param_drift/l2_distance": l2_dist,
+                "param_drift/fisher_distance_train": fisher_dist_train,
+                "param_drift/fisher_distance_test": fisher_dist_test,
+                "trained_task": t,  # x-axis: which task we just finished training
+            })
             
         prev_params = current_params.clone()
         
@@ -164,8 +180,9 @@ def run_experiment(
     
     # Finalize logging
     if logger:
-        logger.set_results(dict(results))
-        logger.train_results = dict(train_results)  # Add this
+        # Note: logger.results is already populated during log_eval calls with both train/test data
+        # Don't overwrite it with set_results - that would lose the train accuracy data
+        logger.train_results = dict(train_results)  # Store for reference
         logger.end_experiment()
         logger.param_distances = param_distances
         
@@ -322,6 +339,86 @@ def run_split_mnist(
     return results, logger
 
 
+def run_split_cifar10(
+    method_name: str = 'ogd',
+    config: Optional[Config] = None,
+    **method_kwargs
+) -> Tuple[Dict[int, List[float]], Optional[ExperimentLogger]]:
+    """Run Split CIFAR-10 (5 tasks × 2 classes) experiment."""
+    config = config or Config()
+    set_seed(config.seed)
+    
+    print(f"\n### Split CIFAR-10 (5 tasks × 2 classes) — {method_name.upper()} ###")
+    
+    tasks, class_groups = build_split_cifar10_tasks(batch_size=config.batch_size)
+    model = MultiHeadCIFARCNN(
+        num_heads=len(class_groups),
+        head_output_sizes=[len(group) for group in class_groups]
+    )
+    
+    method = _create_method(method_name, **method_kwargs)
+    task_names = [f"Classes {', '.join(map(str, group))}" for group in class_groups]
+    
+    logger = None
+    if config.log_dir:
+        exp_name = config.experiment_name or f"split_cifar10_{method_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        logger = ExperimentLogger(config.log_dir, exp_name, config)
+    
+    results = run_experiment(
+        tasks, model, method, config,
+        multihead=True,
+        task_names=task_names,
+        dataset_name="Split CIFAR-10",
+        logger=logger
+    )
+    
+    metrics = compute_metrics(results)
+    print(f"\nFinal avg accuracy: {metrics['avg_final_accuracy']*100:.2f}%")
+    print(f"Avg forgetting: {metrics['avg_forgetting']*100:.2f}%")
+    
+    return results, logger
+
+
+def run_split_cifar100(
+    method_name: str = 'ogd',
+    config: Optional[Config] = None,
+    **method_kwargs
+) -> Tuple[Dict[int, List[float]], Optional[ExperimentLogger]]:
+    """Run Split CIFAR-100 (10 tasks × 10 classes) experiment."""
+    config = config or Config()
+    set_seed(config.seed)
+    
+    print(f"\n### Split CIFAR-100 (10 tasks × 10 classes) — {method_name.upper()} ###")
+    
+    tasks, class_groups = build_split_cifar100_tasks(batch_size=config.batch_size)
+    model = MultiHeadCIFARCNN(
+        num_heads=len(class_groups),
+        head_output_sizes=[len(group) for group in class_groups]
+    )
+    
+    method = _create_method(method_name, **method_kwargs)
+    task_names = [f"Classes {', '.join(map(str, group))}" for group in class_groups]
+    
+    logger = None
+    if config.log_dir:
+        exp_name = config.experiment_name or f"split_cifar100_{method_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        logger = ExperimentLogger(config.log_dir, exp_name, config)
+    
+    results = run_experiment(
+        tasks, model, method, config,
+        multihead=True,
+        task_names=task_names,
+        dataset_name="Split CIFAR-100",
+        logger=logger
+    )
+    
+    metrics = compute_metrics(results)
+    print(f"\nFinal avg accuracy: {metrics['avg_final_accuracy']*100:.2f}%")
+    print(f"Avg forgetting: {metrics['avg_forgetting']*100:.2f}%")
+    
+    return results, logger
+
+
 def _create_method(method_name: str, **kwargs) -> ContinualMethod:
     """Create a continual learning method by name."""
     method_name = method_name.lower()
@@ -380,7 +477,6 @@ def make_exp_name(args):
         parts.append(args.collector)
         parts.append(f"{args.max_directions}dirs")
         parts.append(f"lam{args.fopng_lambda_reg}")
-        parts.append(f"eps{args.fopng_epsilon}")
     elif args.method == "ogd":
         parts.append(args.collector)
         parts.append(f"{args.max_directions}dirs")
@@ -393,6 +489,10 @@ def make_exp_name(args):
         parts.append(f"angles_{angstr}")
     elif args.dataset == "split_mnist":
         parts.append("5tasks")
+    elif args.dataset == "split_cifar10":
+        parts.append("5tasks")
+    elif args.dataset == "split_cifar100":
+        parts.append("10tasks")
 
     # Common parts
     parts.append(f"{args.epochs}epochs")
@@ -408,7 +508,7 @@ def main():
     # Core parameters
     # ------------------------------
     parser.add_argument("--dataset", type=str, required=True,
-                        choices=["permuted_mnist", "rotated_mnist", "split_mnist"])
+                        choices=["permuted_mnist", "rotated_mnist", "split_mnist", "split_cifar10", "split_cifar100"])
 
     parser.add_argument("--method", type=str, required=True,
                         choices=["sgd", "ogd", "fopng"])
@@ -438,12 +538,14 @@ def main():
                         choices=["diagonal", "full", "kfac"])
 
     parser.add_argument("--max_directions", type=int, default=2000)
+    parser.add_argument("--grads_per_task", type=int, default=200,
+                        help="Number of gradient directions to collect per task for OGD/FOPNG")
 
     # FOPNG-specific
     parser.add_argument("--fopng_lambda_reg", type=float, default=0.0,
                         help="Regularization parameter for FOPNG")
-    parser.add_argument("--fopng_epsilon", type=float, default=0.0,
-                        help="Epsilon parameter for FOPNG")
+    parser.add_argument("--fopng_new_fisher_weight", type=float, default=0.5,
+                        help="Weight for new Fisher in weighted average: F_old = (1-w)*F_old + w*F_current")
 
     # K-FAC specific
     parser.add_argument("--kfac_epsilon", type=float, default=0.95,
@@ -461,9 +563,19 @@ def main():
     # Logging / saving
     # --------------------------------
     parser.add_argument("--log_dir", type=str, default="./experiments")
-    parser.add_argument("--save_model", action="store_true")
-    parser.add_argument("--save_plots", action="store_true")
-    parser.add_argument("--save_raw_data", action="store_true")
+    parser.add_argument("--save_model", action="store_true", default=True)
+    parser.add_argument("--save_plots", action="store_true", default=True)
+    parser.add_argument("--save_raw_data", action="store_true", default=True)
+    
+    # Wandb configuration
+    parser.add_argument("--wandb_project", type=str, default="fopng",
+                        help="Wandb project name")
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                        help="Wandb entity/team name")
+    parser.add_argument("--wandb_tags", type=str, nargs="+", default=None,
+                        help="Tags for wandb run")
+    parser.add_argument("--no_wandb", action="store_true",
+                        help="Disable wandb logging")
 
     args = parser.parse_args()
 
@@ -472,14 +584,13 @@ def main():
     # ------------------------------
     exp_name = make_exp_name(args)
     out_dir = Path(args.log_dir) / exp_name
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     config = Config(
         seed=args.seed,
         batch_size=args.batch_size,
         lr=args.lr,
         epochs_per_task=args.epochs,
-        grads_per_task=200,
+        grads_per_task=args.grads_per_task,
         device=args.device,
 
         # Logging
@@ -488,10 +599,16 @@ def main():
         save_model=args.save_model,
         save_plots=args.save_plots,
         save_raw_data=args.save_raw_data,
+        
+        # Wandb configuration
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_tags=args.wandb_tags,
+        use_wandb=not args.no_wandb,
 
         # FOPNG specific
         fopng_lambda_reg=args.fopng_lambda_reg,
-        fopng_epsilon=args.fopng_epsilon,
+        fopng_new_fisher_weight=args.fopng_new_fisher_weight,
     )
 
     # --------------------------------------------------------------------
@@ -539,6 +656,22 @@ def main():
             kfac_update_freq=args.kfac_update_freq,
             kfac_inversion_freq=args.kfac_inversion_freq,
             kfac_use_running_avg=args.kfac_use_running_avg,
+        )
+    elif args.dataset == "split_cifar10":
+        run_split_cifar10(
+            args.method,
+            config=config,
+            collector=args.collector,
+            fisher=args.fisher,
+            max_directions=args.max_directions,
+        )
+    elif args.dataset == "split_cifar100":
+        run_split_cifar100(
+            args.method,
+            config=config,
+            collector=args.collector,
+            fisher=args.fisher,
+            max_directions=args.max_directions,
         )
 
 

@@ -1,111 +1,67 @@
-CUDA_VISIBLE_DEVICES=0 python3 main.py \
-    --dataset split_mnist \
-    --method sgd \
-    --num_tasks 5 \
-    --epochs 5 \
-    --lr 1e-3 \
-    --batch_size 10 \
-    --seed 42 \
-    --device cuda \
-    > runs/run0.log 2>&1 &
+#!/bin/bash
 
-CUDA_VISIBLE_DEVICES=1 python3 main.py \
-    --dataset split_mnist \
-    --method ogd \
-    --collector gtl \
-    --max_directions 200 \
-    --num_tasks 5 \
-    --epochs 5 \
-    --lr 1e-3 \
-    --batch_size 10 \
-    --seed 42 \
-    --device cuda \
-    > runs/run1.log 2>&1 &
+datasets=(rotated_mnist split_mnist permuted_mnist)
+seeds=$(seq 1 1)
 
-CUDA_VISIBLE_DEVICES=2 python3 main.py \
-    --dataset split_mnist \
-    --method fopng \
-    --fisher diagonal \
-    --collector gtl \
-    --max_directions 200 \
-    --num_tasks 5 \
-    --epochs 5 \
-    --lr 1e-3 \
-    --batch_size 10 \
-    --seed 42 \
-    --fopng_lambda_reg 1e-3 \
-    --fopng_epsilon 1e-4 \
-    --device cuda \
-    > runs/run2.log 2>&1 &
+# Learning rate sweeps (6 values each)
+lrs_ogd=(1e-5 5e-5 1e-4 5e-4 1e-3 5e-3)
+lrs_fopng=(5e-6 1e-5 5e-5 1e-4 5e-4 1e-3)
+lrs_sgd=(5e-5 1e-4 5e-4 1e-3 5e-3 1e-2)
 
-CUDA_VISIBLE_DEVICES=3 python3 main.py \
-    --dataset split_mnist \
-    --method fopng \
-    --fisher diagonal \
-    --collector ave \
-    --max_directions 200 \
-    --num_tasks 5 \
-    --epochs 5 \
-    --lr 1e-3 \
-    --batch_size 10 \
-    --seed 42 \
-    --fopng_lambda_reg 1e-3 \
-    --fopng_epsilon 1e-4 \
-    --device cuda \
-    > runs/run3.log 2>&1 &
+for dataset in "${datasets[@]}"; do
+  for seed in $seeds; do
 
-CUDA_VISIBLE_DEVICES=4 python3 main.py \
-    --dataset split_mnist \
-    --method fopng \
-    --fisher diagonal \
-    --collector gtl \
-    --max_directions 200 \
-    --num_tasks 5 \
-    --epochs 5 \
-    --lr 1e-3 \
-    --batch_size 10 \
-    --seed 42 \
-    --fopng_lambda_reg 1e-4 \
-    --fopng_epsilon 1e-4 \
-    --device cuda \
-    > runs/run4.log 2>&1 &
+    echo "==== DATASET $dataset | SEED $seed ===="
 
-CUDA_VISIBLE_DEVICES=5 python3 main.py \
-    --dataset permuted_mnist \
-    --method sgd \
-    --num_tasks 5 \
-    --epochs 5 \
-    --lr 1e-3 \
-    --batch_size 10 \
-    --seed 42 \
-    --device cuda \
-    > runs/run5.log 2>&1 &
+    # ---------------------- OGD ----------------------
+    for lr in "${lrs_ogd[@]}"; do
+      echo "Running OGD (lr=$lr, seed=$seed) on $dataset"
+      python3 main.py \
+          --dataset "$dataset" \
+          --method ogd \
+          --num_tasks 5 \
+          --epochs 5 \
+          --lr "$lr" \
+          --collector gtl \
+          --max_directions 2000 \
+          --grads_per_task 80 \
+          --batch_size 10 \
+          --seed "$seed" \
+          --device mps
+    done
 
-CUDA_VISIBLE_DEVICES=6 python3 main.py \
-    --dataset permuted_mnist \
-    --method ogd \
-    --collector gtl \
-    --max_directions 200 \
-    --num_tasks 5 \
-    --epochs 5 \
-    --lr 1e-3 \
-    --batch_size 10 \
-    --seed 42 \
-    --device cuda \
-    > runs/run6.log 2>&1 &
+    # ---------------------- FOPNG ----------------------
+    for lr in "${lrs_fopng[@]}"; do
+      echo "Running FOPNG (lr=$lr, seed=$seed) on $dataset"
+      python3 main.py \
+          --dataset "$dataset" \
+          --method fopng \
+          --fisher diagonal \
+          --num_tasks 5 \
+          --epochs 5 \
+          --lr "$lr" \
+          --collector gtl \
+          --max_directions 2000 \
+          --grads_per_task 80 \
+          --fopng_lambda_reg 1e-3 \
+          --fopng_new_fisher_weight 0.5 \
+          --batch_size 10 \
+          --seed "$seed" \
+          --device mps
+    done
 
-CUDA_VISIBLE_DEVICES=7 python3 main.py \
-    --dataset permuted_mnist \
-    --method fopng \
-    --fisher diagonal \
-    --collector gtl \
-    --max_directions 200 \
-    --num_tasks 5 \
-    --epochs 5 \
-    --lr 1e-3 \
-    --batch_size 10 \
-    --seed 42 \
-    --fopng_lambda_reg 1e-3 \
-    --fopng_epsilon 1e-4 \
-    --device cuda \
-    > runs/run7.log 2>&1 &
+    # ---------------------- SGD ----------------------
+    for lr in "${lrs_sgd[@]}"; do
+      echo "Running SGD (lr=$lr, seed=$seed) on $dataset"
+      python3 main.py \
+          --dataset "$dataset" \
+          --method sgd \
+          --num_tasks 5 \
+          --epochs 5 \
+          --lr "$lr" \
+          --batch_size 10 \
+          --seed "$seed" \
+          --device mps
+    done
+  done
+done
