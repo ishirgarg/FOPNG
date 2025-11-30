@@ -4,9 +4,9 @@ datasets=(rotated_mnist split_mnist permuted_mnist)
 seeds=$(seq 1 1)
 
 # Learning rate sweeps (6 values each)
-lrs_ogd=(1e-5 5e-5 1e-4 5e-4 1e-3 5e-3)
-lrs_fopng=(5e-6 1e-5 5e-5 1e-4 5e-4 1e-3)
-lrs_sgd=(5e-5 1e-4 5e-4 1e-3 5e-3 1e-2)
+lrs_ogd=(1e-5 5e-5 1e-4 5e-4 1e-3 5e-3 1e-2 5e-2)
+lrs_fopng=(5e-6 1e-5 5e-5 1e-4 5e-4 1e-3 5e-3 1e-2)
+lrs_sgd=(5e-5 1e-4 5e-4 1e-3 5e-3 1e-2 5e-3 1e-2)
 
 for dataset in "${datasets[@]}"; do
   for seed in $seeds; do
@@ -56,6 +56,7 @@ for dataset in "${datasets[@]}"; do
       python3 main.py \
           --dataset "$dataset" \
           --method sgd \
+          --grads_per_task 80 \
           --num_tasks 5 \
           --epochs 5 \
           --lr "$lr" \
