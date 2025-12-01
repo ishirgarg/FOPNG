@@ -132,6 +132,36 @@ def build_split_mnist_tasks(
     return tasks, digits_per_task
 
 
+def build_split_mnist_ic_tasks(
+    batch_size: int = 10,
+    root: str = "./data"
+) -> Tuple[List[Tuple[DataLoader, DataLoader]], List[List[int]]]:
+    """
+    Build Split MNIST with 5 tasks, each containing 2 digits.
+    Unlike split_mnist, uses a single 10-output head instead of task-specific heads.
+    ("ic" = "inference class")
+    """
+    digits_per_task = [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]]
+    
+    base_train = datasets.MNIST(
+        root=root, train=True, download=True, transform=transforms.ToTensor()
+    )
+    base_test = datasets.MNIST(
+        root=root, train=False, download=True, transform=transforms.ToTensor()
+    )
+    
+    tasks = []
+    for digits in digits_per_task:
+        train_subset = SubsetByClass(base_train, digits)
+        test_subset = SubsetByClass(base_test, digits)
+        
+        train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
+        test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False)
+        tasks.append((train_loader, test_loader))
+    
+    return tasks, digits_per_task
+
+
 def _build_cifar_tasks(
     dataset_cls,
     class_groups: List[List[int]],
