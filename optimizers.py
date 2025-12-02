@@ -1,3 +1,4 @@
+import copy
 import torch
 from abc import ABC, abstractmethod
 import numpy as np
@@ -9,7 +10,7 @@ from tqdm import tqdm
 
 from config import Config
 from gradients import GradientMemory, GradientCollector, GTLCollector, AVECollector
-from fisher import FisherEstimator, DiagonalFisherEstimator, FullFisherEstimator
+from fisher import FisherEstimator, DiagonalFisherEstimator, FullFisherEstimator, KFACFisherEstimator
 from utils import get_param_count, apply_update
 from gradients import get_grad_vector, set_grad_vector
 from logger import log
@@ -308,7 +309,10 @@ class FOPNGMethod(ContinualMethod):
         self,
         fisher_estimator: FisherEstimator = None,
         collector: GradientCollector = None,
-        max_directions: int = 2000
+        max_directions: int = 2000,
+        kfac_samples: int = 1000,
+        kfac_update_freq: int = 1,
+        kfac_running_update: bool = False
     ):
         self.fisher_estimator = fisher_estimator or DiagonalFisherEstimator()
         self.collector = collector or AVECollector()
@@ -316,11 +320,17 @@ class FOPNGMethod(ContinualMethod):
         self.memory = GradientMemory(mode='raw', max_directions=max_directions)
         self.F_old: Optional[torch.Tensor] = None
         self.is_diagonal = isinstance(self.fisher_estimator, DiagonalFisherEstimator)
+        self.is_kfac = isinstance(self.fisher_estimator, KFACFisherEstimator)
+        self.model = None
+        self.kfac_samples = kfac_samples  # Number of samples for K-FAC Fisher estimation
+        self.kfac_update_freq = kfac_update_freq  # How often to update running avg (1=every batch)
+        self.kfac_running_update = kfac_running_update  # Whether to update Fisher during training (default False to match diagonal)
     
     def setup(self, model: nn.Module, config: Config):
         self.memory.clear()
         self.F_old = None
         self.lambda_reg = config.fopng_lambda_reg
+        self.model = model
 
     def _compute_update_prep(
         self,
@@ -332,7 +342,57 @@ class FOPNGMethod(ContinualMethod):
         """Precompute terms for FOPNG update if needed."""
         lam = self.lambda_reg
 
-        if self.is_diagonal:
+        if self.is_kfac:
+            # KFAC: Precompute A = G^T @ F_old @ F_new^{-1} @ F_old @ G + λI
+            # This is done once per epoch, then reused for all batches
+            # Similar to diagonal: compute F_new inverses once, reuse them
+            print(f"  [KFAC] Precomputing projection matrix ({G.shape[1]} columns)...")
+            saved_factors = self.fisher_estimator.fisher_factors
+            saved_inverses = self.fisher_estimator.cached_inverses
+            saved_inverses_valid = self.fisher_estimator.inverses_valid
+
+            A_components = []
+            for i in range(G.shape[1]):
+                if (i+1) % 50 == 0:
+                    print(f"  [KFAC]   Column {i+1}/{G.shape[1]}...")
+
+                g_col_dict, g_col_original = self._split_gradient_to_layers(G[:, i])
+
+                # F_old @ g_col
+                self.fisher_estimator.fisher_factors = F_old
+                temp1 = self.fisher_estimator.apply_fisher(g_col_dict)
+
+                # F_new^{-1} @ (F_old @ g_col)
+                self.fisher_estimator.fisher_factors = F_new
+                temp2 = self.fisher_estimator.apply_inverse(temp1, lam)
+
+                # F_old @ F_new^{-1} @ F_old @ g_col
+                self.fisher_estimator.fisher_factors = F_old
+                temp3 = self.fisher_estimator.apply_fisher(temp2)
+
+                A_components.append(self._flatten_gradients(temp3, g_col_original))
+
+            weighted_G = torch.stack(A_components, dim=1)
+            A = G.T @ weighted_G + lam * torch.eye(G.size(1), device=device)
+
+            # Move to CPU for pseudoinverse if on MPS (SVD not supported on MPS)
+            A_device = A.device
+            use_cpu = str(A_device).startswith('mps')
+            if use_cpu:
+                A_cpu = A.cpu()
+                self.A_inv = torch.pinverse(A_cpu).to(A_device)
+            else:
+                self.A_inv = torch.pinverse(A)
+
+            # Store A for condition number check (same as diagonal)
+            self.A = A
+
+            # Restore fisher_factors and cache state
+            self.fisher_estimator.fisher_factors = saved_factors
+            self.fisher_estimator.cached_inverses = saved_inverses
+            self.fisher_estimator.inverses_valid = saved_inverses_valid
+            print(f"  [KFAC] Precomputation complete")
+        elif self.is_diagonal:
             # Diagonal Fisher approximation
             F_new_inv_diag = 1.0 / (F_new + lam)
             F_old_diag = F_old.view(-1, 1)
@@ -375,7 +435,167 @@ class FOPNGMethod(ContinualMethod):
         lam = self.lambda_reg
         stats = {}
 
-        if self.is_diagonal:
+        if self.is_kfac:
+            # KFAC-based FOPNG: Same structure as diagonal, but using KFAC operations
+            # Split into weight dict and keep original for biases
+            grad_dict, original_grad = self._split_gradient_to_layers(gradient)
+            saved_factors = self.fisher_estimator.fisher_factors
+
+            # DEBUG 1: Check input gradient
+            # print(f"\n[DEBUG] Input gradient norm: {gradient.norm().item():.6f}")
+            # print(f"[DEBUG] Input gradient has NaN: {torch.isnan(gradient).any()}")
+            # print(f"[DEBUG] Input gradient has Inf: {torch.isinf(gradient).any()}")
+
+            # Step 1: F_old @ gradient
+            self.fisher_estimator.fisher_factors = F_old
+            F_old_g_dict = self.fisher_estimator.apply_fisher(grad_dict)
+            F_old_g = self._flatten_gradients(F_old_g_dict, original_grad)  # Pass original
+
+            # DEBUG 2: After F_old application
+            # print(f"[DEBUG] After F_old: norm = {F_old_g.norm().item():.6f}")
+            # print(f"[DEBUG] After F_old: has NaN = {torch.isnan(F_old_g).any()}")
+
+            # Step 2: G^T @ F_old @ gradient
+            G_T_F_old_g = G.T @ F_old_g
+
+            # Step 3: A^{-1} @ G^T @ F_old @ gradient (A^{-1} was precomputed)
+            A_inv_G_T_F_old_g = self.A_inv @ G_T_F_old_g
+
+            # Step 4: Project: correction = F_old @ G @ A^{-1} @ G^T @ F_old @ g
+            correction_vec = G @ A_inv_G_T_F_old_g
+            correction_unweighted = correction_vec.clone()  # Save for diagnostics
+            correction_dict, _ = self._split_gradient_to_layers(correction_vec)  # Take just the dict
+            correction_dict_applied = self.fisher_estimator.apply_fisher(correction_dict)
+            correction = self._flatten_gradients(correction_dict_applied, original_grad)  # Pass original
+
+            # DEBUG 3: Correction
+            # print(f"[DEBUG] Correction norm: {correction.norm().item():.6f}")
+            # print(f"[DEBUG] Correction has NaN: {torch.isnan(correction).any()}")
+
+            P_g = gradient - correction
+
+            # DEBUG 4: Projected gradient
+            # print(f"[DEBUG] Projected grad norm: {P_g.norm().item():.6f}")
+            # print(f"[DEBUG] Projection ratio: {P_g.norm().item() / (gradient.norm().item() + 1e-10):.4f}")
+
+            # Step 5: Apply F_new^{-1} to projected gradient
+            P_g_dict, _ = self._split_gradient_to_layers(P_g)  # Take just the dict
+            self.fisher_estimator.fisher_factors = F_new
+            F_new_inv_P_g_dict = self.fisher_estimator.apply_inverse(P_g_dict, lam)
+            F_new_inv_P_g = self._flatten_gradients(F_new_inv_P_g_dict, original_grad)  # Pass original
+
+            # DEBUG 5: After preconditioning
+            # print(f"[DEBUG] After F_new^-1: norm = {F_new_inv_P_g.norm().item():.6f}")
+            # print(f"[DEBUG] After F_new^-1: has NaN: {torch.isnan(F_new_inv_P_g).any()}")
+
+            # Step 6: Normalize (use lr like diagonal does)
+            denom = torch.sqrt((P_g * F_new_inv_P_g).sum() + 1e-8)
+            # print(f"[DEBUG] Denominator: {denom.item():.6f}")
+
+            # Check for NaN/inf to prevent numerical instability
+            if torch.isnan(denom) or torch.isinf(denom) or denom <= 0:
+                # Fallback: use raw gradient if normalization fails
+                v_star = -lr * gradient / (gradient.norm() + 1e-8)
+            else:
+                v_star = -lr * F_new_inv_P_g / (denom + 1e-8)
+
+            # Check for NaN in update and clip if necessary
+            if torch.isnan(v_star).any() or torch.isinf(v_star).any():
+                # Fallback: use raw gradient scaled by learning rate
+                v_star = -lr * gradient / (gradient.norm() + 1e-8)
+
+            # DEBUG 6: Final update
+            # print(f"[DEBUG] Final update norm: {v_star.norm().item():.6f}")
+            # print(f"[DEBUG] Final update has NaN: {torch.isnan(v_star).any()}")
+            # print(f"[DEBUG] Update-to-grad ratio: {v_star.norm().item() / (gradient.norm().item() + 1e-10):.4f}")
+
+            if return_intermediate:
+                # --- DIAGNOSTICS FOR CORRECTION (matching diagonal) ---
+                # Calculate norms for pipeline steps
+                step1_norm = F_old_g.norm().item()
+                step2_norm = G_T_F_old_g.norm().item()
+                step3_norm = A_inv_G_T_F_old_g.norm().item()
+                step4_norm = correction_unweighted.norm().item()
+                step5_norm = correction.norm().item()
+                grad_norm = gradient.norm().item()
+
+                # Calculate matrix properties
+                g_norm = G.norm().item()
+                dim = G.shape[0]
+                g_normalized = g_norm / (np.sqrt(dim) + 1e-10)
+
+                # Calculate A matrix conditioning
+                a_norm = torch.norm(self.A).item()
+                a_inv_norm = torch.norm(self.A_inv).item()
+                a_cond = torch.linalg.cond(self.A).item()
+
+                # Compute F_old norm (aggregate across layers for KFAC)
+                if isinstance(F_old, dict):
+                    f_old_norm = sum(
+                        F_old[name]['A'].norm().item() + F_old[name]['G'].norm().item()
+                        for name in F_old
+                    )
+                else:
+                    f_old_norm = F_old.norm().item()
+
+                # Ratios
+                ratio1 = step1_norm / (grad_norm + 1e-10)
+                ratio2 = step2_norm / (step1_norm + 1e-10)
+                ratio3 = step3_norm / (step2_norm + 1e-10)
+                ratio4 = step4_norm / (step3_norm + 1e-10)
+                ratio5 = step5_norm / (step4_norm + 1e-10)
+
+                stats.update({
+                    'correction/step1_norm_F_old_g': step1_norm,
+                    'correction/step2_norm_G_T_F_old_g': step2_norm,
+                    'correction/step3_norm_A_inv_G_T': step3_norm,
+                    'correction/step4_norm_correction_unweighted': step4_norm,
+                    'correction/step5_norm_correction_final': step5_norm,
+
+                    'correction/ratio1_Fold_g_vs_g': ratio1,
+                    'correction/ratio2_proj_vs_Fold_g': ratio2,
+                    'correction/ratio3_Ainv_vs_proj': ratio3,
+                    'correction/ratio4_unweighted_vs_Ainv': ratio4,
+                    'correction/ratio5_final_vs_unweighted': ratio5,
+
+                    'correction/G_norm_normalized': g_normalized,
+                    'correction/G_abs_mean': G.abs().mean().item(),
+                    'correction/A_condition_number': a_cond,
+                    'correction/A_norm': a_norm,
+                    'correction/A_inv_norm': a_inv_norm,
+
+                    'correction/lambda_ratio_Fold': f_old_norm / (lam + 1e-10),
+                })
+
+                # Compute comprehensive statistics (same structure as diagonal)
+                raw_norm = gradient.norm().item()
+                fisher_norm = F_old_g.norm().item()  # Use F_old @ g as "Fisher space" analog
+                correction_norm = correction.norm().item()
+                P_g_eucl_norm = P_g.norm().item()
+                v_star_norm = v_star.norm().item()
+
+                # Relative changes
+                diff_eucl = (gradient - P_g).norm().item()
+                projection_relative_change = diff_eucl / (raw_norm + 1e-10)
+
+                stats.update({
+                    'raw_grad_norm': raw_norm,
+                    'fisher_grad_norm': fisher_norm,
+                    'correction_norm': correction_norm,
+                    'projected_grad_eucl_norm': P_g_eucl_norm,
+                    'projected_grad_fisher_norm': 0.0,  # Not computed for KFAC (would need F_old^{1/2})
+                    'update_norm': v_star_norm,
+                    'projection_relative_change': projection_relative_change,
+                    'fisher_projection_relative_change': 0.0,  # Not computed for KFAC
+                    'correction_to_raw_ratio': correction_norm / (raw_norm + 1e-10),
+                    'update_to_raw_ratio': v_star_norm / (raw_norm + 1e-10),
+                    'projected_to_raw_ratio_eucl': P_g_eucl_norm / (raw_norm + 1e-10),
+                    'projected_to_raw_ratio_fisher': 0.0,  # Not computed for KFAC
+                })
+
+            # Restore fisher_factors (we changed it to F_old in step 1)
+            self.fisher_estimator.fisher_factors = saved_factors
+        elif self.is_diagonal:
             # Transform to Fisher space: g_F = F_old^{1/2} * g
             F_old_sqrt = torch.sqrt(F_old + 1e-10)
             g_fisher = F_old_sqrt * gradient
@@ -556,23 +776,56 @@ class FOPNGMethod(ContinualMethod):
             )
         
         # Compute Fisher matrices
-        F_new = self.fisher_estimator.estimate(model, train_loader, criterion, config.device)
+        if self.is_kfac:
+            F_new = self.fisher_estimator.estimate(
+                model, train_loader, criterion, config.device, 
+                task_id=task_id if multihead else None,
+                max_samples=self.kfac_samples
+            )
+        else:
+            F_new = self.fisher_estimator.estimate(
+                model, train_loader, criterion, config.device, 
+                task_id=task_id if multihead else None
+            )
         
         if self.F_old is None:
-            self.F_old = F_new.clone()
-        
-        # Log Fisher matrix properties (computed once per epoch)
-        fisher_new_norm = F_new.norm().item()
-        fisher_old_norm = self.F_old.norm().item()
-        fisher_diff_norm = (F_new - self.F_old).norm().item()
-        fisher_relative_diff = fisher_diff_norm / (fisher_old_norm + 1e-10)
-        
+            if self.is_kfac:
+                # Deep copy KFAC dictionary structure
+                self.F_old = copy.deepcopy(F_new)
+            else:
+                self.F_old = F_new.clone()
+                
         # For diagonal Fisher, also track trace (sum of diagonal)
-        if self.is_diagonal:
+        if self.is_kfac:
+            # For KFAC, compute aggregate norm across all layer factors
+            fisher_new_norm = sum(
+                F_new[name]['A'].norm().item() + F_new[name]['G'].norm().item() 
+                for name in F_new
+            )
+            fisher_old_norm = sum(
+                self.F_old[name]['A'].norm().item() + self.F_old[name]['G'].norm().item() 
+                for name in self.F_old
+            )
+            fisher_diff_norm = sum(
+                (F_new[name]['A'] - self.F_old[name]['A']).norm().item() + 
+                (F_new[name]['G'] - self.F_old[name]['G']).norm().item()
+                for name in F_new if name in self.F_old
+            )
+            fisher_relative_diff = fisher_diff_norm / (fisher_old_norm + 1e-10)
+            fisher_new_trace = None
+            fisher_old_trace = None
+            fisher_trace_diff = None
+            fisher_trace_relative_diff = None
+        elif self.is_diagonal:
             fisher_new_trace = F_new.sum().item()
             fisher_old_trace = self.F_old.sum().item()
             fisher_trace_diff = abs(fisher_new_trace - fisher_old_trace)
             fisher_trace_relative_diff = fisher_trace_diff / (abs(fisher_old_trace) + 1e-10)
+
+            fisher_new_norm = F_new.norm().item()
+            fisher_old_norm = self.F_old.norm().item()
+            fisher_diff_norm = (F_new - self.F_old).norm().item()
+            fisher_relative_diff = fisher_diff_norm / (fisher_old_norm + 1e-10)
         else:
             fisher_new_trace = torch.trace(F_new).item() if F_new.dim() == 2 else None
             fisher_old_trace = torch.trace(self.F_old).item() if self.F_old.dim() == 2 else None
@@ -586,6 +839,17 @@ class FOPNGMethod(ContinualMethod):
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
+
+        if self.is_kfac:
+            print(f"[FOPNG] Computing matrix inverses for epoch...")
+            # Set fisher_factors to F_new and compute inverses
+            saved_factors = self.fisher_estimator.fisher_factors
+            self.fisher_estimator.fisher_factors = F_new
+            self.fisher_estimator.recompute_inverses(damping=self.lambda_reg)
+            # Restore original fisher_factors
+            self.fisher_estimator.fisher_factors = saved_factors
+
+        print(f"[FOPNG] Precomputing update matrices...")
         
         self._compute_update_prep(F_new, self.F_old, G, config.device)
         iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
@@ -625,8 +889,9 @@ class FOPNGMethod(ContinualMethod):
             'correction/A_inv_norm': [],
             'correction/lambda_ratio_Fold': [],
         }
-        
+        batch_num = 0
         for x, y in iterator:
+            batch_num += 1
             x = x.to(config.device)
             y = y.to(config.device)
             
@@ -638,6 +903,14 @@ class FOPNGMethod(ContinualMethod):
             loss = criterion(output, y)
             model.zero_grad()
             loss.backward()
+
+            if self.is_kfac and self.kfac_running_update and batch_num % self.kfac_update_freq == 0:
+                self.fisher_estimator.update_running_average(
+                    model, x, y, criterion, config.device,
+                    task_id=task_id if multihead else None
+                )
+                # After updating Fisher, need to update F_new reference
+                F_new = self.fisher_estimator.fisher_factors
             
             grad = get_grad_vector(model)
             update, stats = self._compute_update(grad, F_new, self.F_old, G, config.device, config.lr, return_intermediate=True)
@@ -758,13 +1031,36 @@ class FOPNGMethod(ContinualMethod):
     ):
         # Update F_old with current task's Fisher
         criterion = nn.CrossEntropyLoss()
-        F_current = self.fisher_estimator.estimate(model, train_loader, criterion, config.device)
+        if self.is_kfac:
+            F_current = self.fisher_estimator.estimate(
+                model, train_loader, criterion, config.device,
+                task_id=task_id if multihead else None,
+                max_samples=self.kfac_samples
+            )
+        else:
+            F_current = self.fisher_estimator.estimate(
+                model, train_loader, criterion, config.device,
+                task_id=task_id if multihead else None
+            )
         
         if self.F_old is None:
             self.F_old = F_current
         else:
             w = getattr(config, 'fopng_new_fisher_weight')
-            self.F_old = (1 - w) * self.F_old + w * F_current
+            w = getattr(config, 'fopng_new_fisher_weight', 0.5)
+            if self.is_kfac:
+                # For KFAC, merge layers that exist in both, keep new layers
+                for name in F_current:
+                    if name in self.F_old:
+                        # Weighted average of shared layers (trunk)
+                        self.F_old[name]['A'] = (1 - w) * self.F_old[name]['A'] + w * F_current[name]['A']
+                        self.F_old[name]['G'] = (1 - w) * self.F_old[name]['G'] + w * F_current[name]['G']
+                    else:
+                        # Add new task-specific layers (heads)
+                        self.F_old[name] = F_current[name]
+            else:
+                # For diagonal/full Fisher (tensors)
+                self.F_old = (1 - w) * self.F_old + w * F_current
         
         # Collect gradients
         print(f"Collecting FOPNG directions from task {task_id}...")
@@ -777,6 +1073,75 @@ class FOPNGMethod(ContinualMethod):
             multihead=multihead,
             task_id=task_id if multihead else None
         )
+
+    def _split_gradient_to_layers(self, grad_vector: torch.Tensor) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        """
+        Convert flat gradient vector to {layer_name: weight_matrix} and separate bias gradient.
+        
+        Returns:
+            Tuple of (weight_grad_dict, full_grad_vector) where full_grad_vector is the original input
+        """
+        grad_dict = {}
+        idx = 0
+        for name, param in self.model.named_parameters():
+            if 'weight' in name and isinstance(self.model.get_submodule(name.replace('.weight', '')), nn.Linear):
+                n = param.numel()
+                layer_name = name.replace('.weight', '')
+                grad_dict[layer_name] = grad_vector[idx:idx+n].view_as(param)
+                idx += n
+            elif 'weight' in name:
+                # Non-linear layers, skip for now
+                n = param.numel()
+                idx += n
+            else:
+                # Bias and other params
+                n = param.numel()
+                idx += n
+
+        return grad_dict, grad_vector  # Return original gradient too
+
+    def _flatten_gradients(self, grad_dict: Dict[str, torch.Tensor], original_grad: torch.Tensor) -> torch.Tensor:
+        """
+        Convert {layer_name: weight_matrix} back to flat vector, preserving non-weight gradients.
+        
+        Args:
+            grad_dict: Dict of preconditioned weight gradients
+            original_grad: Original full gradient vector (for bias terms)
+        """
+        full_grad = []
+        idx = 0
+        total_bias_norm = 0.0
+        total_weight_norm = 0.0
+
+        for name, param in self.model.named_parameters():
+            n = param.numel()
+
+            if 'weight' in name:
+                layer_name = name.replace('.weight', '')
+                if layer_name in grad_dict:
+                    # Use preconditioned weight gradient
+                    weight_grad = grad_dict[layer_name].view(-1)
+                    full_grad.append(weight_grad)
+                    total_weight_norm += weight_grad.norm().item() ** 2
+                else:
+                    # For non-KFAC layers, use original gradient
+                    weight_grad = original_grad[idx:idx+n]
+                    full_grad.append(weight_grad)
+                    total_weight_norm += weight_grad.norm().item() ** 2
+            else:
+                # For biases: use original gradient (not preconditioned by KFAC)
+                bias_grad = original_grad[idx:idx+n]
+                full_grad.append(bias_grad)
+                total_bias_norm += bias_grad.norm().item() ** 2
+
+            idx += n
+
+        # import numpy as np
+        # print(f"[DEBUG _flatten] Weight grad norm: {np.sqrt(total_weight_norm):.6f}")
+        # print(f"[DEBUG _flatten] Bias grad norm: {np.sqrt(total_bias_norm):.6f}  ← Should NOT be zero!")
+
+        return torch.cat(full_grad)
+
 
 class FNGMethod(ContinualMethod):
     """

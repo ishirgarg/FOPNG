@@ -20,7 +20,7 @@ from datasets import (
 )
 from optimizers import ContinualMethod, SGDMethod, AdamMethod, OGDMethod, FOPNGMethod, FNGMethod, AVECollector
 from gradients import GTLCollector, GradientCollector
-from fisher import DiagonalFisherEstimator, FullFisherEstimator, FisherEstimator, fisher_norm_distance
+from fisher import DiagonalFisherEstimator, FullFisherEstimator, FisherEstimator, KFACFisherEstimator, fisher_norm_distance
 from utils import set_seed, evaluate
 from visualization import plot_results
 from logger import ExperimentLogger
@@ -417,13 +417,33 @@ def run_split_cifar100(
     return results, logger
 
 
-def _get_fisher_estimator(fisher_type: str = 'diagonal') -> FisherEstimator:
+def _get_fisher_estimator(fisher_type: str = 'diagonal', **kwargs) -> FisherEstimator:
     """Create a Fisher estimator by type."""
     fisher_type = fisher_type.lower()
     if fisher_type == 'full':
         return FullFisherEstimator()
-    else:
+    elif fisher_type == 'kfac':
+        kfac_epsilon = kwargs.get('kfac_epsilon', 0.95)
+        kfac_use_running = kwargs.get('kfac_use_running_avg', True)
+        kfac_inversion_freq = kwargs.get('kfac_inversion_freq', None)
+        return KFACFisherEstimator(
+            epsilon=kfac_epsilon,
+            use_running_avg=kfac_use_running,
+            inversion_freq=kfac_inversion_freq
+        )
+    elif fisher_type == 'diagonal':
+        kfac_epsilon = kwargs.get('kfac_epsilon', 0.95)
+        kfac_use_running = kwargs.get('kfac_use_running_avg', True)
+        kfac_inversion_freq = kwargs.get('kfac_inversion_freq', None)
+        fisher_est = KFACFisherEstimator(
+            epsilon=kfac_epsilon,
+            use_running_avg=kfac_use_running,
+            inversion_freq=kfac_inversion_freq
+        )
+    elif fisher_type == 'diagonal':
         return DiagonalFisherEstimator()
+    else:
+        raise ValueError(f"Unknown fisher estimator type: {fisher_type}")
 
 
 def _get_collector(collector_type: str = 'gtl') -> GradientCollector:
@@ -448,16 +468,22 @@ def _create_method(method_name: str, **kwargs) -> ContinualMethod:
         max_dirs = kwargs.get('max_directions', 2000)
         return OGDMethod(collector=collector, max_directions=max_dirs)
     elif method_name == 'fopng':
-        fisher_est = _get_fisher_estimator(kwargs.get('fisher', 'diagonal'))
+        fisher_est = _get_fisher_estimator(kwargs.get('fisher', 'diagonal'), kwargs=kwargs)
         collector = _get_collector(kwargs.get('collector', 'ave'))
         max_dirs = kwargs.get('max_directions', 2000)
+        kfac_samples = kwargs.get('kfac_samples', 1000)
+        kfac_update_freq = kwargs.get('kfac_update_freq', 1)
+        kfac_running_update = kwargs.get('kfac_running_update', False)
         return FOPNGMethod(
             fisher_estimator=fisher_est,
             collector=collector,
             max_directions=max_dirs
+            kfac_samples=kfac_samples,
+            kfac_update_freq=kfac_update_freq,
+            kfac_running_update=kfac_running_update
         )
     elif method_name == 'fng':
-        fisher_est = _get_fisher_estimator(kwargs.get('fisher', 'diagonal'))
+        fisher_est = _get_fisher_estimator(kwargs.get('fisher', 'diagonal'), kwargs=kwargs)
         return FNGMethod(fisher_estimator=fisher_est)
     else:
         raise ValueError(f"Unknown method: {method_name}")
@@ -533,7 +559,7 @@ def main():
                         choices=["gtl", "ave"])
 
     parser.add_argument("--fisher", type=str, default="diagonal",
-                        choices=["diagonal", "full"])
+                        choices=["diagonal", "full", "kfac"])
 
     parser.add_argument("--max_directions", type=int, default=2000)
     parser.add_argument("--grads_per_task", type=int, default=200,
@@ -544,6 +570,20 @@ def main():
                         help="Regularization parameter for FOPNG")
     parser.add_argument("--fopng_new_fisher_weight", type=float, default=0.5,
                         help="Weight for new Fisher in weighted average: F_old = (1-w)*F_old + w*F_current")
+    
+    # K-FAC specific
+    parser.add_argument("--kfac_epsilon", type=float, default=0.95,
+                        help="Moving average decay parameter for K-FAC (0.95 = 95%% old, 5%% new)")
+    parser.add_argument("--kfac_samples", type=int, default=1000,
+                        help="Number of samples for K-FAC Fisher estimation")
+    parser.add_argument("--kfac_update_freq", type=int, default=1,
+                        help="How often to update K-FAC running average (1=every batch)")
+    parser.add_argument("--kfac_running_update", action="store_true", default=False,
+                        help="Enable running Fisher updates during training (default False to match diagonal)")
+    parser.add_argument("--kfac_inversion_freq", type=int, default=None,
+                        help="How often to recompute matrix inverses (None=manual, e.g. 10, 50, 100)")
+    parser.add_argument("--kfac_use_running_avg", action="store_true", default=True,
+                        help="Use running averages for K-FAC (recommended)")
 
     # --------------------------------
     # Logging / saving
@@ -608,6 +648,12 @@ def main():
             collector=args.collector,
             fisher=args.fisher,
             max_directions=args.max_directions,
+            kfac_epsilon=args.kfac_epsilon,
+            kfac_samples=args.kfac_samples,
+            kfac_update_freq=args.kfac_update_freq,
+            kfac_running_update=args.kfac_running_update,
+            kfac_inversion_freq=args.kfac_inversion_freq,
+            kfac_use_running_avg=args.kfac_use_running_avg,
         )
 
     elif args.dataset == "rotated_mnist":
@@ -618,6 +664,12 @@ def main():
             collector=args.collector,
             fisher=args.fisher,
             max_directions=args.max_directions,
+            kfac_epsilon=args.kfac_epsilon,
+            kfac_samples=args.kfac_samples,
+            kfac_update_freq=args.kfac_update_freq,
+            kfac_running_update=args.kfac_running_update,
+            kfac_inversion_freq=args.kfac_inversion_freq,
+            kfac_use_running_avg=args.kfac_use_running_avg,
         )
 
     elif args.dataset == "split_mnist":
@@ -627,6 +679,12 @@ def main():
             collector=args.collector,
             fisher=args.fisher,
             max_directions=args.max_directions,
+            kfac_epsilon=args.kfac_epsilon,
+            kfac_samples=args.kfac_samples,
+            kfac_update_freq=args.kfac_update_freq,
+            kfac_running_update=args.kfac_running_update,
+            kfac_inversion_freq=args.kfac_inversion_freq,
+            kfac_use_running_avg=args.kfac_use_running_avg,
         )
     elif args.dataset == "split_cifar10":
         run_split_cifar10(
@@ -635,6 +693,12 @@ def main():
             collector=args.collector,
             fisher=args.fisher,
             max_directions=args.max_directions,
+            kfac_epsilon=args.kfac_epsilon,
+            kfac_samples=args.kfac_samples,
+            kfac_update_freq=args.kfac_update_freq,
+            kfac_running_update=args.kfac_running_update,
+            kfac_inversion_freq=args.kfac_inversion_freq,
+            kfac_use_running_avg=args.kfac_use_running_avg,
         )
     elif args.dataset == "split_cifar100":
         run_split_cifar100(
@@ -643,6 +707,12 @@ def main():
             collector=args.collector,
             fisher=args.fisher,
             max_directions=args.max_directions,
+            kfac_epsilon=args.kfac_epsilon,
+            kfac_samples=args.kfac_samples,
+            kfac_update_freq=args.kfac_update_freq,
+            kfac_running_update=args.kfac_running_update,
+            kfac_inversion_freq=args.kfac_inversion_freq,
+            kfac_use_running_avg=args.kfac_use_running_avg,
         )
 
 
