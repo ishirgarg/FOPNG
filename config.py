@@ -11,6 +11,7 @@ class Config:
     epochs_per_task: int
     grads_per_task: int
     device: str
+    fisher: str
     
     # Logging
     log_dir: Optional[str]

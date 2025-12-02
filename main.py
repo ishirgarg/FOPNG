@@ -618,6 +618,7 @@ def main():
         epochs_per_task=args.epochs,
         grads_per_task=args.grads_per_task,
         device=args.device,
+        fisher=args.fisher,
 
         # Logging
         log_dir=str(out_dir),
