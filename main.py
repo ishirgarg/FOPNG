@@ -18,7 +18,7 @@ from datasets import (
     build_split_cifar10_tasks,
     build_split_cifar100_tasks,
 )
-from optimizers import ContinualMethod, SGDMethod, AdamMethod, OGDMethod, FOPNGMethod, FNGMethod, AVECollector
+from optimizers import ContinualMethod, SGDMethod, AdamMethod, OGDMethod, FOPNGMethod, FNGMethod, EWCMethod, AVECollector
 from gradients import GTLCollector, GradientCollector
 from fisher import DiagonalFisherEstimator, FullFisherEstimator, FisherEstimator, fisher_norm_distance
 from utils import set_seed, evaluate
@@ -459,6 +459,9 @@ def _create_method(method_name: str, **kwargs) -> ContinualMethod:
     elif method_name == 'fng':
         fisher_est = _get_fisher_estimator(kwargs.get('fisher', 'diagonal'))
         return FNGMethod(fisher_estimator=fisher_est)
+    elif method_name == 'ewc':
+        fisher_est = _get_fisher_estimator(kwargs.get('fisher', 'diagonal'))
+        return EWCMethod(fisher_estimator=fisher_est)
     else:
         raise ValueError(f"Unknown method: {method_name}")
 
@@ -478,6 +481,9 @@ def make_exp_name(args):
     elif args.method == "ogd":
         parts.append(args.collector)
         parts.append(f"{args.max_directions}dirs")
+    elif args.method == "ewc":
+        parts.append(args.fisher)
+        parts.append(f"lambda{args.ewc_lambda}")
 
     # Dataset-specific parts
     if args.dataset == "permuted_mnist":
@@ -509,7 +515,7 @@ def main():
                         choices=["permuted_mnist", "rotated_mnist", "split_mnist", "split_cifar10", "split_cifar100"])
 
     parser.add_argument("--method", type=str, required=True,
-                        choices=["sgd", "adam", "ogd", "fopng", "fng"])
+                        choices=["sgd", "adam", "ogd", "fopng", "fng", "ewc"])
 
     parser.add_argument("--batch_size", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=5)
@@ -544,6 +550,12 @@ def main():
                         help="Regularization parameter for FOPNG")
     parser.add_argument("--fopng_new_fisher_weight", type=float, default=0.5,
                         help="Weight for new Fisher in weighted average: F_old = (1-w)*F_old + w*F_current")
+
+    # EWC-specific
+    parser.add_argument("--ewc_lambda", type=float, default=1000.0,
+                        help="Regularization strength for EWC penalty")
+    parser.add_argument("--ewc_fisher_samples", type=int, default=None,
+                        help="Number of samples for Fisher estimation (None = use all)")
 
     # --------------------------------
     # Logging / saving
@@ -595,6 +607,10 @@ def main():
         # FOPNG specific
         fopng_lambda_reg=args.fopng_lambda_reg,
         fopng_new_fisher_weight=args.fopng_new_fisher_weight,
+        
+        # EWC specific
+        ewc_lambda=args.ewc_lambda,
+        ewc_fisher_samples=args.ewc_fisher_samples,
     )
 
     # --------------------------------------------------------------------

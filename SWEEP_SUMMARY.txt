@@ -1,0 +1,75 @@
+================================================================================
+                    YOUR SWEEP METHODOLOGY - QUICK REFERENCE
+================================================================================
+
+📊 ALL YOUR SWEEPS AT A GLANCE:
+
+Common to All:
+  datasets: rotated_mnist, split_mnist, permuted_mnist
+  seeds: 1
+  batch_size: 10
+  epochs: 5
+  num_tasks: 5
+
+Method Comparison:
+┌─────────┬──────────┬────────────────────┬────────────┬────────────┐
+│ Method  │ Script   │ Learning Rates     │ Other Var  │ Total Runs │
+├─────────┼──────────┼────────────────────┼────────────┼────────────┤
+│ OGD     │ main.sh  │ 8 values           │ -          │ 24         │
+│ FOPNG   │ main.sh  │ 8 values           │ -          │ 24         │
+│ SGD     │ main.sh  │ 6 values           │ -          │ 18         │
+│ Adam    │ adam.sh  │ 4 values           │ -          │ 12         │
+│ FNG     │ fng.sh   │ 4 values           │ -          │ 12         │
+│ EWC     │ ewc.sh   │ 4 values           │ 4 lambdas  │ 48         │
+└─────────┴──────────┴────────────────────┴────────────┴────────────┘
+
+main.sh total: 66 runs (OGD + FOPNG + SGD)
+fng.sh total: 12 runs
+adam.sh total: 12 runs
+ewc.sh total: 48 runs
+
+================================================================================
+
+🎯 YOUR PATTERN:
+
+1. Single seed (seed=1)
+   → You're doing exploratory sweeps, not final results
+   → Would need 3-5 seeds for publication
+
+2. Learning rate is PRIMARY variable
+   → Complex methods: 8 LR values
+   → Simple methods: 4 LR values
+
+3. Fixed hyperparameters for most methods
+   → FOPNG lambda: 1e-3 (NOT swept)
+   → FNG lambda: 1e-3 (NOT swept)
+   → EWC lambda: SWEPT (1000, 5000, 10000, 50000)
+
+4. Sequential execution in scripts
+   → All configs for one dataset, then next
+
+================================================================================
+
+🆕 EWC MATCHES YOUR STYLE:
+
+✓ Same 3 datasets
+✓ Same 1 seed
+✓ Same fixed params (batch_size, epochs, num_tasks)
+✓ 4 LR values (like FNG/Adam)
+✓ Adds lambda sweep (4 values) - unique to EWC
+✓ More runs (48) because it sweeps TWO dimensions (LR × lambda)
+
+================================================================================
+
+💡 KEY INSIGHT:
+
+You don't sweep other methods' lambdas (FOPNG=1e-3, FNG=1e-3 are fixed)
+But you DO sweep EWC lambda (1000-50000)
+
+Why? EWC lambda is more critical - it directly controls forgetting!
+   • Too low → forget old tasks
+   • Too high → can't learn new tasks
+   • Must find sweet spot
+
+================================================================================
+

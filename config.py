@@ -29,6 +29,10 @@ class Config:
     fopng_lambda_reg: float = 0.0
     fopng_new_fisher_weight: float = 0.5  # Weight for new Fisher: F_old = (1-w)*F_old + w*F_current
     
+    # EWC specific
+    ewc_lambda: float = 100.0  # Regularization strength for EWC penalty (original paper uses 10-400)
+    ewc_fisher_samples: Optional[int] = None  # Number of samples for Fisher estimation (None = use all)
+    
     def __post_init__(self):
         if self.device == "auto":
             if torch.cuda.is_available():

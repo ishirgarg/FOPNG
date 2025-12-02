@@ -1005,3 +1005,156 @@ class FNGMethod(ContinualMethod):
         multihead: bool = False
     ):
         pass
+
+
+class EWCMethod(ContinualMethod):
+    """
+    Elastic Weight Consolidation (EWC).
+    
+    Adds a quadratic penalty to the loss to preserve important parameters
+    from previous tasks: L_EWC = L_task + (λ/2) Σ F_i (θ_i - θ*_i)^2
+    
+    where F_i is the diagonal Fisher information and θ*_i are the optimal
+    parameters from previous tasks.
+    """
+    
+    def __init__(self, fisher_estimator: FisherEstimator = None):
+        self.fisher_estimator = fisher_estimator or DiagonalFisherEstimator()
+        self.is_diagonal = isinstance(self.fisher_estimator, DiagonalFisherEstimator)
+        
+        # Store consolidated Fisher information and optimal parameters from all previous tasks
+        self.fisher_dict: Dict[str, torch.Tensor] = {}
+        self.optimal_params: Dict[str, torch.Tensor] = {}
+        self.ewc_lambda: float = 0.0
+    
+    def setup(self, model: nn.Module, config: Config):
+        """Initialize EWC state."""
+        self.fisher_dict.clear()
+        self.optimal_params.clear()
+        self.ewc_lambda = config.ewc_lambda
+    
+    def _compute_ewc_loss(self, model: nn.Module) -> torch.Tensor:
+        """
+        Compute EWC regularization loss: (λ/2) Σ F_i (θ_i - θ*_i)^2
+        """
+        if not self.fisher_dict:
+            return torch.tensor(0.0, device=next(model.parameters()).device)
+        
+        ewc_loss = torch.tensor(0.0, device=next(model.parameters()).device)
+        
+        for name, param in model.named_parameters():
+            if name in self.fisher_dict:
+                fisher = self.fisher_dict[name]
+                optimal = self.optimal_params[name]
+                # Quadratic penalty weighted by Fisher information
+                ewc_loss += (fisher * (param - optimal).pow(2)).sum()
+        
+        return (self.ewc_lambda / 2.0) * ewc_loss
+    
+    def train_epoch(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        train_loader: DataLoader,
+        criterion: nn.Module,
+        config: Config,
+        task_id: int,
+        multihead: bool = False,
+        progress_desc: Optional[str] = None
+    ) -> Tuple[float, float]:
+        model.train()
+        total_loss = 0.0
+        total_task_loss = 0.0
+        total_ewc_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        
+        iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
+        
+        for x, y in iterator:
+            x = x.to(config.device)
+            y = y.to(config.device)
+            
+            optimizer.zero_grad()
+            
+            if multihead:
+                logits = model(x, task_id=task_id)
+            else:
+                logits = model(x)
+            
+            # Task loss
+            task_loss = criterion(logits, y)
+            
+            # EWC penalty (only applied after first task)
+            ewc_loss = self._compute_ewc_loss(model) if task_id > 0 else torch.tensor(0.0, device=config.device)
+            
+            # Total loss
+            loss = task_loss + ewc_loss
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item() * x.size(0)
+            total_task_loss += task_loss.item() * x.size(0)
+            total_ewc_loss += ewc_loss.item() * x.size(0)
+            preds = logits.argmax(dim=1)
+            total_correct += (preds == y).sum().item()
+            total_samples += x.size(0)
+        
+        avg_loss = total_loss / total_samples
+        avg_task_loss = total_task_loss / total_samples
+        avg_ewc_loss = total_ewc_loss / total_samples
+        accuracy = total_correct / total_samples
+        
+        return avg_loss, accuracy
+    
+    def after_task(
+        self,
+        model: nn.Module,
+        train_loader: DataLoader,
+        task_id: int,
+        config: Config,
+        multihead: bool = False
+    ):
+        """
+        After completing a task:
+        1. Compute Fisher information on current task
+        2. Store current parameters as optimal
+        3. Accumulate Fisher (sum across tasks)
+        """
+        print(f"Computing Fisher information for EWC after task {task_id}...")
+        
+        # Estimate Fisher on current task
+        criterion = nn.CrossEntropyLoss()
+        
+        # Create subset of data if ewc_fisher_samples is specified
+        if config.ewc_fisher_samples is not None and config.ewc_fisher_samples > 0:
+            from torch.utils.data import Subset
+            import random
+            indices = random.sample(range(len(train_loader.dataset)), 
+                                  min(config.ewc_fisher_samples, len(train_loader.dataset)))
+            subset = Subset(train_loader.dataset, indices)
+            fisher_loader = DataLoader(subset, batch_size=train_loader.batch_size, shuffle=False)
+        else:
+            fisher_loader = train_loader
+        
+        fisher_flat = self.fisher_estimator.estimate(model, fisher_loader, criterion, config.device)
+        
+        # Convert flat Fisher back to dict
+        idx = 0
+        task_fisher = {}
+        for name, param in model.named_parameters():
+            num_params = param.numel()
+            task_fisher[name] = fisher_flat[idx:idx+num_params].view_as(param).clone()
+            idx += num_params
+        
+        # Accumulate Fisher information (sum over tasks - original EWC)
+        for name, param in model.named_parameters():
+            if name in self.fisher_dict:
+                self.fisher_dict[name] += task_fisher[name]
+            else:
+                self.fisher_dict[name] = task_fisher[name].clone()
+            
+            # Store optimal parameters
+            self.optimal_params[name] = param.data.clone()
+        
+        print(f"EWC: Fisher information computed and accumulated for task {task_id}")
