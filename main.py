@@ -15,6 +15,7 @@ from datasets import (
     build_permuted_mnist_tasks,
     build_rotated_mnist_tasks,
     build_split_mnist_tasks,
+    build_split_mnist_ic_tasks,
     build_split_cifar10_tasks,
     build_split_cifar100_tasks,
 )
@@ -337,6 +338,49 @@ def run_split_mnist(
     return results, logger
 
 
+def run_split_mnist_ic(
+    method_name: str = 'ogd',
+    config: Optional[Config] = None,
+    **method_kwargs
+) -> Tuple[Dict[int, List[float]], Optional[ExperimentLogger]]:
+    """
+    Run Split MNIST IC (Inference Class) experiment.
+    
+    Unlike run_split_mnist which uses 5 task-specific heads (2 outputs each),
+    this uses a single shared 10-output MLP head. Tasks are still separated by digit classes.
+    """
+    config = config or Config()
+    set_seed(config.seed)
+    
+    print(f"\n### Split MNIST IC (5 tasks × 2 digits, single 10-class head) — {method_name.upper()} ###")
+    
+    tasks, digits_per_task = build_split_mnist_ic_tasks(config.batch_size)
+    model = MLP(input_dim=784, hidden_dim=100, num_classes=10)
+    
+    method = _create_method(method_name, **method_kwargs)
+    task_names = [f"Digits {d}" for d in digits_per_task]
+    
+    # Setup logger
+    logger = None
+    if config.log_dir:
+        exp_name = config.experiment_name or f"split_mnist_ic_{method_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        logger = ExperimentLogger(config.log_dir, exp_name, config)
+    
+    results = run_experiment(
+        tasks, model, method, config,
+        multihead=False,
+        task_names=task_names,
+        dataset_name="Split MNIST IC",
+        logger=logger
+    )
+    
+    metrics = compute_metrics(results)
+    print(f"\nFinal avg accuracy: {metrics['avg_final_accuracy']*100:.2f}%")
+    print(f"Avg forgetting: {metrics['avg_forgetting']*100:.2f}%")
+    
+    return results, logger
+
+
 def run_split_cifar10(
     method_name: str = 'ogd',
     config: Optional[Config] = None,
@@ -487,6 +531,8 @@ def make_exp_name(args):
         parts.append(f"angles_{angstr}")
     elif args.dataset == "split_mnist":
         parts.append("5tasks")
+    elif args.dataset == "split_mnist_ic":
+        parts.append("5tasks")
     elif args.dataset == "split_cifar10":
         parts.append("5tasks")
     elif args.dataset == "split_cifar100":
@@ -506,7 +552,7 @@ def main():
     # Core parameters
     # ------------------------------
     parser.add_argument("--dataset", type=str, required=True,
-                        choices=["permuted_mnist", "rotated_mnist", "split_mnist", "split_cifar10", "split_cifar100"])
+                        choices=["permuted_mnist", "rotated_mnist", "split_mnist", "split_mnist_ic", "split_cifar10", "split_cifar100"])
 
     parser.add_argument("--method", type=str, required=True,
                         choices=["sgd", "adam", "ogd", "fopng", "fng"])
@@ -622,6 +668,14 @@ def main():
 
     elif args.dataset == "split_mnist":
         run_split_mnist(
+            args.method,
+            config=config,
+            collector=args.collector,
+            fisher=args.fisher,
+            max_directions=args.max_directions,
+        )
+    elif args.dataset == "split_mnist_ic":
+        run_split_mnist_ic(
             args.method,
             config=config,
             collector=args.collector,
