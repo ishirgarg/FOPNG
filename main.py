@@ -477,7 +477,7 @@ def _create_method(method_name: str, **kwargs) -> ContinualMethod:
         return FOPNGMethod(
             fisher_estimator=fisher_est,
             collector=collector,
-            max_directions=max_dirs
+            max_directions=max_dirs,
             kfac_samples=kfac_samples,
             kfac_update_freq=kfac_update_freq,
             kfac_running_update=kfac_running_update
