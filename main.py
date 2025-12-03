@@ -19,7 +19,7 @@ from datasets import (
     build_split_cifar10_tasks,
     build_split_cifar100_tasks,
 )
-from optimizers import ContinualMethod, SGDMethod, AdamMethod, OGDMethod, FOPNGMethod, FNGMethod, AVECollector
+from optimizers import ContinualMethod, FOPNGPreFisherMethod, SGDMethod, AdamMethod, OGDMethod, FOPNGMethod, FNGMethod, AVECollector
 from gradients import GTLCollector, GradientCollector
 from fisher import DiagonalFisherEstimator, FullFisherEstimator, FisherEstimator, fisher_norm_distance
 from utils import set_seed, evaluate
@@ -58,7 +58,7 @@ def run_experiment(
     
     # Default optimizer selection
     if optimizer_class is None:
-        if isinstance(method, FOPNGMethod) or isinstance(method, AdamMethod):
+        if isinstance(method, FOPNGMethod) or isinstance(method, AdamMethod) or isinstance(method, FOPNGPreFisherMethod):
             optimizer_class = torch.optim.Adam
         else:
             optimizer_class = torch.optim.SGD
@@ -493,9 +493,18 @@ def _create_method(method_name: str, **kwargs) -> ContinualMethod:
         return OGDMethod(collector=collector, max_directions=max_dirs)
     elif method_name == 'fopng':
         fisher_est = _get_fisher_estimator(kwargs.get('fisher', 'diagonal'))
-        collector = _get_collector(kwargs.get('collector', 'ave'))
+        collector = _get_collector(kwargs.get('collector', 'gtl'))
         max_dirs = kwargs.get('max_directions', 2000)
         return FOPNGMethod(
+            fisher_estimator=fisher_est,
+            collector=collector,
+            max_directions=max_dirs
+        )
+    elif method_name == 'fopng_prefisher':
+        fisher_est = _get_fisher_estimator(kwargs.get('fisher', 'diagonal'))
+        collector = _get_collector(kwargs.get('collector', 'gtl'))
+        max_dirs = kwargs.get('max_directions', 2000)
+        return FOPNGPreFisherMethod(
             fisher_estimator=fisher_est,
             collector=collector,
             max_directions=max_dirs
@@ -513,6 +522,11 @@ def make_exp_name(args):
 
     # Method-specific parts
     if args.method == "fopng":
+        parts.append(args.fisher)
+        parts.append(args.collector)
+        parts.append(f"{args.max_directions}dirs")
+        parts.append(f"lam{args.fopng_lambda_reg}")
+    elif args.method == "fopng_prefisher":
         parts.append(args.fisher)
         parts.append(args.collector)
         parts.append(f"{args.max_directions}dirs")
@@ -555,7 +569,7 @@ def main():
                         choices=["permuted_mnist", "rotated_mnist", "split_mnist", "split_mnist_ic", "split_cifar10", "split_cifar100"])
 
     parser.add_argument("--method", type=str, required=True,
-                        choices=["sgd", "adam", "ogd", "fopng", "fng"])
+                        choices=["sgd", "adam", "ogd", "fopng", "fopng_prefisher", "fng"])
 
     parser.add_argument("--batch_size", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=5)

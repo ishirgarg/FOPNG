@@ -1005,3 +1005,302 @@ class FNGMethod(ContinualMethod):
         multihead: bool = False
     ):
         pass
+
+class FOPNGPreFisherMethod(ContinualMethod):    
+    def __init__(
+        self,
+        fisher_estimator: FisherEstimator = None,
+        collector: GradientCollector = None,
+        max_directions: int = 2000
+    ):
+        self.fisher_estimator = fisher_estimator or DiagonalFisherEstimator()
+        self.collector = collector or AVECollector()
+        self.memory = GradientMemory(mode='raw', max_directions=max_directions)
+        self.F_old: Optional[torch.Tensor] = None
+        self.is_diagonal = isinstance(self.fisher_estimator, DiagonalFisherEstimator)
+        # Store Fisher from each task
+        self.F_tasks: Dict[int, torch.Tensor] = {}
+    
+    def setup(self, model: nn.Module, config: Config):
+        self.memory.clear()
+        self.F_old = None
+        self.F_tasks = {}
+        self.lambda_reg = config.fopng_lambda_reg
+
+    def _compute_update_prep(
+        self,
+        F_new: torch.Tensor,
+        F_old: torch.Tensor,
+        G_prefisher: torch.Tensor,
+        device: str
+    ):
+        """Precompute A and A_inv for FOPNG-PF update with pre-Fisher gradients."""
+        lam = self.lambda_reg
+
+        if self.is_diagonal:
+            # Since G is already F*g, we just use it directly
+            # A = G.T @ G (no F_old multiplication needed - already baked in G)
+            F_new_inv_diag = 1.0 / (F_new + lam)
+            A = G_prefisher.T @ (F_new_inv_diag.view(-1, 1) * G_prefisher) + lam * torch.eye(G_prefisher.size(1), device=device)
+            self.A_inv = torch.pinverse(A)
+            self.A = A
+        else:
+            raise NotImplementedError("Full Fisher not implemented for FOPNG-PF.")
+
+    def _compute_update(
+        self,
+        gradient: torch.Tensor,
+        F_new: torch.Tensor,
+        F_old: torch.Tensor,
+        G_prefisher: torch.Tensor,
+        device: str,
+        lr: float,
+        return_intermediate: bool = True
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, float]]]:
+        """
+        Compute FOPNG-PF update step with pre-multiplied Fisher gradients.
+        
+        KEY SIMPLIFICATION:
+        - Original: F_old_g = F_old * gradient, then G_T_F_old_g = G.T @ F_old_g
+        - FOPNG-PF: G_T_g = G.T @ gradient (G already has Fisher baked in)
+        """
+        lam = self.lambda_reg
+        stats = {}
+
+        if self.is_diagonal:
+            F_new_inv_diag = 1.0 / (F_new + lam)
+            
+            G_T_g = G_prefisher.T @ gradient
+            
+            A_inv_G_T_g = self.A_inv @ G_T_g
+            correction = (G_prefisher @ A_inv_G_T_g).view(-1)
+            P_g = gradient - correction
+
+            if return_intermediate:
+                # Diagnostic norms for pipeline
+                step1_norm = G_T_g.norm().item()
+                step2_norm = A_inv_G_T_g.norm().item()
+                correction_unweighted = (G_prefisher @ A_inv_G_T_g).view(-1)
+                step3_norm = correction_unweighted.norm().item()
+                step4_norm = correction.norm().item()
+                grad_norm = gradient.norm().item()
+                
+                # Matrix properties
+                g_norm = G_prefisher.norm().item()
+                dim = G_prefisher.shape[0]
+                g_normalized = g_norm / (np.sqrt(dim) + 1e-10)
+                
+                a_norm = torch.norm(self.A).item()
+                a_inv_norm = torch.norm(self.A_inv).item()
+                a_cond = torch.linalg.cond(self.A).item() if device != 'mps' else 0.0
+                
+                # Ratios for each pipeline step
+                ratio1 = step1_norm / (grad_norm + 1e-10)
+                ratio2 = step2_norm / (step1_norm + 1e-10)
+                ratio3 = step3_norm / (step2_norm + 1e-10)
+                ratio4 = step4_norm / (step3_norm + 1e-10)
+
+                stats.update({
+                    'correction/step1_norm_G_T_g': step1_norm,
+                    'correction/step2_norm_A_inv_G_T_g': step2_norm,
+                    'correction/step3_norm_correction_unweighted': step3_norm,
+                    'correction/step4_norm_correction_final': step4_norm,
+                    'correction/ratio1_G_T_g_vs_g': ratio1,
+                    'correction/ratio2_Ainv_vs_G_T_g': ratio2,
+                    'correction/ratio3_unweighted_vs_Ainv': ratio3,
+                    'correction/ratio4_final_vs_unweighted': ratio4,
+                    'correction/G_norm_normalized': g_normalized,
+                    'correction/G_abs_mean': G_prefisher.abs().mean().item(),
+                    'correction/A_condition_number': a_cond,
+                    'correction/A_norm': a_norm,
+                    'correction/A_inv_norm': a_inv_norm,
+                    'correction/lambda_ratio_F_new': F_new.norm().item() / (lam + 1e-10),
+                })
+            
+    
+            # Natural gradient step
+            F_new_inv_P_g = P_g * F_new_inv_diag
+            denom = torch.sqrt((P_g * F_new_inv_P_g).sum() + 1e-8)
+            v_star = -lr * F_new_inv_P_g / (denom + 1e-8)
+            
+            if return_intermediate:
+                # Comprehensive statistics
+                raw_norm = gradient.norm().item()
+                correction_norm = correction.norm().item()
+                P_g_eucl_norm = P_g.norm().item()
+                v_star_norm = v_star.norm().item()
+                
+                # Relative changes
+                diff_eucl = (gradient - P_g).norm().item()
+                projection_relative_change = diff_eucl / (raw_norm + 1e-10)
+                
+                stats.update({
+                    'raw_grad_norm': raw_norm,
+                    'correction_norm': correction_norm,
+                    'projected_grad_eucl_norm': P_g_eucl_norm,
+                    'update_norm': v_star_norm,
+                    'projection_relative_change': projection_relative_change,
+                    'correction_to_raw_ratio': correction_norm / (raw_norm + 1e-10),
+                    'update_to_raw_ratio': v_star_norm / (raw_norm + 1e-10),
+                    'projected_to_raw_ratio_eucl': P_g_eucl_norm / (raw_norm + 1e-10),
+                })
+        else:
+            raise NotImplementedError("Full Fisher not implemented for FOPNG-PF.")
+        
+        return (v_star, stats) if return_intermediate else v_star
+    
+    def train_epoch(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        train_loader: DataLoader,
+        criterion: nn.Module,
+        config: Config,
+        task_id: int,
+        multihead: bool = False,
+        progress_desc: Optional[str] = None
+    ) -> Tuple[float, float]:
+        
+        # First task uses regular training
+        G_prefisher = self.memory.get_matrix()
+        if task_id == 0 or G_prefisher is None:
+            return self._train_regular(
+                model, optimizer, train_loader, criterion, config,
+                task_id, multihead, progress_desc
+            )
+        
+        # Compute current task's Fisher
+        F_new = self.fisher_estimator.estimate(model, train_loader, criterion, config.device)
+        if self.F_old is None:
+            self.F_old = F_new.clone()
+        
+        model.train()
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        
+        self._compute_update_prep(F_new, self.F_old, G_prefisher, config.device)
+        iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
+        
+        batch_stats = {}
+        
+        for x, y in iterator:
+            x = x.to(config.device)
+            y = y.to(config.device)
+            
+            if multihead:
+                output = model(x, task_id=task_id)
+            else:
+                output = model(x)
+            
+            loss = criterion(output, y)
+            model.zero_grad()
+            loss.backward()
+            
+            grad = get_grad_vector(model)
+            update, stats = self._compute_update(grad, F_new, self.F_old, G_prefisher, config.device, config.lr, return_intermediate=True)
+            apply_update(model, update)
+            
+            # Accumulate statistics
+            for key, value in stats.items():
+                if key not in batch_stats:
+                    batch_stats[key] = []
+                batch_stats[key].append(value)
+            
+            total_loss += loss.item() * x.size(0)
+            preds = output.argmax(dim=1)
+            total_correct += (preds == y).sum().item()
+            total_samples += x.size(0)
+        
+        # Log average statistics
+        for key, values in batch_stats.items():
+            if values:
+                log({
+                    f"fopng_gradients/{key}_mean": np.mean(values),
+                    f"fopng_gradients/{key}_std": np.std(values),
+                    "task_id": task_id,
+                })
+        
+        return total_loss / total_samples, total_correct / total_samples
+    
+    def _train_regular(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        train_loader: DataLoader,
+        criterion: nn.Module,
+        config: Config,
+        task_id: int,
+        multihead: bool = False,
+        progress_desc: Optional[str] = None
+    ) -> Tuple[float, float]:
+        """Regular training for first task."""
+        model.train()
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        raw_grad_norms = []
+        
+        iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
+        
+        for x, y in iterator:
+            x = x.to(config.device)
+            y = y.to(config.device)
+            
+            optimizer.zero_grad()
+            if multihead:
+                logits = model(x, task_id=task_id)
+            else:
+                logits = model(x)
+            
+            loss = criterion(logits, y)
+            loss.backward()
+            grad = get_grad_vector(model)
+            raw_grad_norms.append(grad.norm().item())
+            optimizer.step()
+            
+            total_loss += loss.item() * x.size(0)
+            preds = logits.argmax(dim=1)
+            total_correct += (preds == y).sum().item()
+            total_samples += x.size(0)
+        
+        log({
+            "fopng_gradients/raw_grad_norm_mean": np.mean(raw_grad_norms),
+            "fopng_gradients/raw_grad_norm_std": np.std(raw_grad_norms),
+            "task_id": task_id,
+        })
+        
+        return total_loss / total_samples, total_correct / total_samples
+    
+    def after_task(
+        self,
+        model: nn.Module,
+        train_loader: DataLoader,
+        task_id: int,
+        config: Config,
+        multihead: bool = False
+    ):
+        """
+        Collect task gradients PRE-MULTIPLIED by the task's Fisher.
+        
+        This is the key innovation: instead of collecting raw gradients G,
+        we collect F*G where F is the Fisher for the current task.
+        """
+        criterion = nn.CrossEntropyLoss()
+        F_current = self.fisher_estimator.estimate(model, train_loader, criterion, config.device)
+        
+        # Store Fisher for this task
+        self.F_tasks[task_id] = F_current.clone()
+        
+        # Collect gradients PRE-MULTIPLIED by Fisher
+        print(f"Collecting FOPNG-PF directions from task {task_id} (pre-multiplied by Fisher)...")
+        self.collector.collect_prefisher(
+            self.memory,
+            model,
+            train_loader,
+            config.grads_per_task,
+            F_current,  # Pass Fisher for pre-multiplication
+            config.device,
+            multihead=multihead,
+            task_id=task_id if multihead else None
+        )

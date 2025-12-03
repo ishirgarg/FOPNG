@@ -126,6 +126,34 @@ class GradientCollector(ABC):
     ):
         """Collect gradient directions from a task."""
         pass
+    
+    def collect_prefisher(
+        self,
+        memory: GradientMemory,
+        model: nn.Module,
+        dataloader: DataLoader,
+        num_directions: int,
+        fisher_matrix: torch.Tensor,
+        device: str,
+        multihead: bool = False,
+        task_id: Optional[int] = None
+    ):
+        # Create a temporary memory buffer for raw gradients
+        temp_memory = GradientMemory(mode=memory.mode, max_directions=num_directions)
+        
+        # Collect raw gradients into temporary buffer
+        self.collect(temp_memory, model, dataloader, num_directions, device, multihead, task_id)
+        
+        for grad_vec in temp_memory.vectors:
+            if isinstance(fisher_matrix, torch.Tensor):
+                # Diagonal Fisher
+                if fisher_matrix.dim() == 1:
+                    prefisher_grad = fisher_matrix * grad_vec
+                else:
+                    prefisher_grad = fisher_matrix @ grad_vec
+            else:
+                prefisher_grad = grad_vec
+            memory.add(prefisher_grad)
 
 
 class GTLCollector(GradientCollector):
