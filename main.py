@@ -491,6 +491,9 @@ def _create_method(method_name: str, **kwargs) -> ContinualMethod:
         collector = _get_collector(kwargs.get('collector', 'gtl'))
         max_dirs = kwargs.get('max_directions', 2000)
         return OGDMethod(collector=collector, max_directions=max_dirs)
+    elif method_name == 'ewc':
+        fisher_est = _get_fisher_estimator(kwargs.get('fisher', 'diagonal'))
+        return EWCMethod(fisher_estimator=fisher_est)
     elif method_name == 'fopng':
         fisher_est = _get_fisher_estimator(kwargs.get('fisher', 'diagonal'))
         collector = _get_collector(kwargs.get('collector', 'gtl'))
@@ -533,6 +536,9 @@ def make_exp_name(args):
         parts.append(f"lam{args.fopng_lambda_reg}")
     elif args.method == "fng":
         parts.append(args.fisher)
+    elif args.method == "ewc":
+        parts.append(args.fisher)
+        parts.append(f"lambda{args.ewc_lambda}")
     elif args.method == "ogd":
         parts.append(args.collector)
         parts.append(f"{args.max_directions}dirs")
@@ -569,13 +575,17 @@ def main():
                         choices=["permuted_mnist", "rotated_mnist", "split_mnist", "split_mnist_ic", "split_cifar10", "split_cifar100"])
 
     parser.add_argument("--method", type=str, required=True,
-                        choices=["sgd", "adam", "ogd", "fopng", "fopng_prefisher", "fng"])
+                        choices=["sgd", "adam", "ogd", "fopng", "fopng_prefisher", "fng", "ewc"])
 
     parser.add_argument("--batch_size", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--device", type=str, default="auto")
+
+    # EWC-specific
+    parser.add_argument("--ewc_lambda", type=float, default=1000.0,
+                        help="Regularization strength for EWC penalty")
 
     # --------------------------------
     # Dataset-specific
@@ -660,7 +670,12 @@ def main():
         fopng_lambda_reg=args.fopng_lambda_reg,
         fopng_new_fisher_weight=args.fopng_new_fisher_weight,
         use_empirical_fisher=args.use_empirical_fisher,
+
+        # Fisher
         fisher_batch_size=args.fisher_batch_size,
+
+        # EWC
+        ewc_lambda=args.ewc_lambda,
     )
 
     # --------------------------------------------------------------------
