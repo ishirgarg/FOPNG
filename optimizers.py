@@ -1285,22 +1285,41 @@ class FOPNGPreFisherMethod(ContinualMethod):
         
         This is the key innovation: instead of collecting raw gradients G,
         we collect F*G where F is the Fisher for the current task.
+        
+        Two strategies:
+        1. use_empirical_fisher=False (default): Estimate Fisher matrix and multiply
+        2. use_empirical_fisher=True: Compute F*g on-the-fly for each gradient g
+           using the empirical Fisher F = sum_i(g_i * g_i^T) without storing the n x n matrix
         """
-        criterion = nn.CrossEntropyLoss()
-        F_current = self.fisher_estimator.estimate(model, train_loader, criterion, config.device)
-        
-        # Store Fisher for this task
-        self.F_tasks[task_id] = F_current.clone()
-        
-        # Collect gradients PRE-MULTIPLIED by Fisher
-        print(f"Collecting FOPNG-PF directions from task {task_id} (pre-multiplied by Fisher)...")
-        self.collector.collect_prefisher(
-            self.memory,
-            model,
-            train_loader,
-            config.grads_per_task,
-            F_current,  # Pass Fisher for pre-multiplication
-            config.device,
-            multihead=multihead,
-            task_id=task_id if multihead else None
-        )
+        if getattr(config, 'use_empirical_fisher', False):
+            # Use empirical Fisher: compute F*g on-the-fly for each collected gradient
+            print(f"Collecting FOPNG-PF directions from task {task_id} (empirical Fisher-preconditioned)...")
+            self.collector.collect_empirical_fisher_preconditioned(
+                self.memory,
+                model,
+                train_loader,
+                config.grads_per_task,
+                config.device,
+                multihead=multihead,
+                task_id=task_id if multihead else None
+            )
+        else:
+            # Use estimated Fisher: compute F_current and pre-multiply
+            criterion = nn.CrossEntropyLoss()
+            F_current = self.fisher_estimator.estimate(model, train_loader, criterion, config.device)
+            
+            # Store Fisher for this task
+            self.F_tasks[task_id] = F_current.clone()
+            
+            # Collect gradients PRE-MULTIPLIED by Fisher
+            print(f"Collecting FOPNG-PF directions from task {task_id} (pre-multiplied by estimated Fisher)...")
+            self.collector.collect_prefisher(
+                self.memory,
+                model,
+                train_loader,
+                config.grads_per_task,
+                F_current,  # Pass Fisher for pre-multiplication
+                config.device,
+                multihead=multihead,
+                task_id=task_id if multihead else None
+            )

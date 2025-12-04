@@ -154,6 +154,50 @@ class GradientCollector(ABC):
             else:
                 prefisher_grad = grad_vec
             memory.add(prefisher_grad)
+    
+    def collect_empirical_fisher_preconditioned(
+        self,
+        memory: GradientMemory,
+        model: nn.Module,
+        dataloader: DataLoader,
+        num_directions: int,
+        device: str,
+        multihead: bool = False,
+        task_id: Optional[int] = None
+    ):
+        """
+        Collect gradients pre-multiplied by empirical Fisher using associative property.
+        
+        Key idea: F = sum_i(g_i * g_i^T), so F*g = sum_i(g_i * (g_i^T * g))
+        For each gradient g, we compute F*g by accumulating contributions from all 
+        collected gradients without storing the n x n Fisher matrix.
+        
+        First pass: collect all raw gradients
+        Second pass: for each collected gradient, compute F*g and add to memory
+        """
+        # First pass: collect all raw gradients
+        print(f"Collecting empirical Fisher-preconditioned gradients (task {task_id})...")
+        temp_memory = GradientMemory(mode=memory.mode, max_directions=num_directions)
+        
+        self.collect(temp_memory, model, dataloader, num_directions, device, multihead, task_id)
+        
+        if not temp_memory.vectors:
+            return
+        
+        raw_gradients = temp_memory.vectors  # List of gradient vectors
+        
+        # Second pass: for each collected gradient, compute F*g on-the-fly
+        for g in raw_gradients:
+            # Compute F*g = sum_i(g_i * (g_i^T * g))
+            Fg = torch.zeros_like(g)
+            for g_i in raw_gradients:
+                # g_i^T * g: scalar dot product
+                dot_prod = torch.dot(g_i, g)
+                # g_i * (g_i^T * g): accumulate scaled gradient
+                Fg = Fg + g_i * dot_prod
+            
+            # Add the empirical Fisher preconditioned gradient to memory
+            memory.add(Fg)
 
 
 class GTLCollector(GradientCollector):

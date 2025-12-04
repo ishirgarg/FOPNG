@@ -28,6 +28,8 @@ class Config:
     # FOPNG specific
     fopng_lambda_reg: float = 0.0
     fopng_new_fisher_weight: float = 0.5  # Weight for new Fisher: F_old = (1-w)*F_old + w*F_current
+    use_empirical_fisher: bool = False  # For FOPNG-PF: compute F*g on-the-fly during gradient collection instead of pre-multiplying by estimated Fisher
+    fisher_batch_size: Optional[int] = None  # If set, estimate Fisher from this batch size instead of using the full training set
     
     def __post_init__(self):
         if self.device == "auto":

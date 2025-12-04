@@ -604,6 +604,8 @@ def main():
                         help="Regularization parameter for FOPNG")
     parser.add_argument("--fopng_new_fisher_weight", type=float, default=0.5,
                         help="Weight for new Fisher in weighted average: F_old = (1-w)*F_old + w*F_current")
+    parser.add_argument("--use_empirical_fisher", action="store_true", default=False,
+                        help="For FOPNG-PF: compute F*g on-the-fly during gradient collection instead of pre-multiplying by estimated Fisher")
 
     # --------------------------------
     # Logging / saving
@@ -655,6 +657,7 @@ def main():
         # FOPNG specific
         fopng_lambda_reg=args.fopng_lambda_reg,
         fopng_new_fisher_weight=args.fopng_new_fisher_weight,
+        use_empirical_fisher=args.use_empirical_fisher,
     )
 
     # --------------------------------------------------------------------
