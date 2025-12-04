@@ -19,7 +19,7 @@ from datasets import (
     build_split_cifar10_tasks,
     build_split_cifar100_tasks,
 )
-from optimizers import ContinualMethod, FOPNGPreFisherMethod, SGDMethod, AdamMethod, OGDMethod, FOPNGMethod, FNGMethod, AVECollector
+from optimizers import ContinualMethod, FOPNGPreFisherMethod, SGDMethod, AdamMethod, OGDMethod, FOPNGMethod, FNGMethod, AVECollector, EWCMethod
 from gradients import GTLCollector, GradientCollector
 from fisher import DiagonalFisherEstimator, FullFisherEstimator, FisherEstimator, fisher_norm_distance
 from utils import set_seed, evaluate

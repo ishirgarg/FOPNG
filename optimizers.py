@@ -1448,18 +1448,7 @@ class EWCMethod(ContinualMethod):
         # Estimate Fisher on current task
         criterion = nn.CrossEntropyLoss()
 
-        # Create subset of data if ewc_fisher_samples is specified
-        if config.ewc_fisher_samples is not None and config.ewc_fisher_samples > 0:
-            from torch.utils.data import Subset
-            import random
-            indices = random.sample(range(len(train_loader.dataset)), 
-                                  min(config.ewc_fisher_samples, len(train_loader.dataset)))
-            subset = Subset(train_loader.dataset, indices)
-            fisher_loader = DataLoader(subset, batch_size=train_loader.batch_size, shuffle=False)
-        else:
-            fisher_loader = train_loader
-
-        fisher_flat = self.fisher_estimator.estimate(model, fisher_loader, criterion, config.device)
+        fisher_flat = self.fisher_estimator.estimate(model, train_loader, criterion, config.device, config.fisher_batch_size)
 
         # Convert flat Fisher back to dict
         idx = 0

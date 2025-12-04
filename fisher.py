@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch.func import functional_call, vmap, grad
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import numpy as np
 
 from utils import get_param_count
@@ -51,10 +51,12 @@ class DiagonalFisherEstimator(FisherEstimator):
         if device.startswith('cuda'):
             torch.cuda.empty_cache()
         
-        # If batch_size is specified, create a new loader with that batch size
+        # If batch_size is specified, use only that many samples total for estimation
         if batch_size is not None:
             dataset = dataloader.dataset
-            fisher_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+            # Take only the first batch_size samples
+            limited_dataset = Subset(dataset, range(min(batch_size, len(dataset))))
+            fisher_loader = DataLoader(limited_dataset, batch_size=len(limited_dataset), shuffle=False)
         else:
             fisher_loader = dataloader
         
@@ -172,11 +174,12 @@ class FullFisherEstimator(FisherEstimator):
         if device.startswith('cuda'):
             torch.cuda.empty_cache()
         
-        # If batch_size is specified, create a new loader with that batch size
+        # If batch_size is specified, use only that many samples total for estimation
         if batch_size is not None:
-            from torch.utils.data import DataLoader as DL
             dataset = dataloader.dataset
-            fisher_loader = DL(dataset, batch_size=batch_size, shuffle=False)
+            # Take only the first batch_size samples
+            limited_dataset = Subset(dataset, range(min(batch_size, len(dataset))))
+            fisher_loader = DataLoader(limited_dataset, batch_size=len(limited_dataset), shuffle=False)
         else:
             fisher_loader = dataloader
         
