@@ -606,6 +606,8 @@ def main():
                         help="Weight for new Fisher in weighted average: F_old = (1-w)*F_old + w*F_current")
     parser.add_argument("--use_empirical_fisher", action="store_true", default=False,
                         help="For FOPNG-PF: compute F*g on-the-fly during gradient collection instead of pre-multiplying by estimated Fisher")
+    parser.add_argument("--fisher_batch_size", type=int, default=None,
+                        help="If set, estimate Fisher from this batch size instead of the full training set")
 
     # --------------------------------
     # Logging / saving
@@ -658,6 +660,7 @@ def main():
         fopng_lambda_reg=args.fopng_lambda_reg,
         fopng_new_fisher_weight=args.fopng_new_fisher_weight,
         use_empirical_fisher=args.use_empirical_fisher,
+        fisher_batch_size=args.fisher_batch_size,
     )
 
     # --------------------------------------------------------------------

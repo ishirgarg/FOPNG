@@ -556,7 +556,8 @@ class FOPNGMethod(ContinualMethod):
             )
         
         # Compute Fisher matrices
-        F_new = self.fisher_estimator.estimate(model, train_loader, criterion, config.device)
+        fisher_batch_size = getattr(config, 'fisher_batch_size', None)
+        F_new = self.fisher_estimator.estimate(model, train_loader, criterion, config.device, batch_size=fisher_batch_size)
         
         if self.F_old is None:
             self.F_old = F_new.clone()
@@ -758,7 +759,8 @@ class FOPNGMethod(ContinualMethod):
     ):
         # Update F_old with current task's Fisher
         criterion = nn.CrossEntropyLoss()
-        F_current = self.fisher_estimator.estimate(model, train_loader, criterion, config.device)
+        fisher_batch_size = getattr(config, 'fisher_batch_size', None)
+        F_current = self.fisher_estimator.estimate(model, train_loader, criterion, config.device, batch_size=fisher_batch_size)
         
         if self.F_old is None:
             self.F_old = F_current
@@ -855,7 +857,8 @@ class FNGMethod(ContinualMethod):
             )
         
         # Compute Fisher matrices
-        F_new = self.fisher_estimator.estimate(model, train_loader, criterion, config.device)
+        fisher_batch_size = getattr(config, 'fisher_batch_size', None)
+        F_new = self.fisher_estimator.estimate(model, train_loader, criterion, config.device, batch_size=fisher_batch_size)
         
         # Log Fisher matrix properties (computed once per epoch)
         fisher_new_norm = F_new.norm().item()
@@ -1170,7 +1173,8 @@ class FOPNGPreFisherMethod(ContinualMethod):
             )
         
         # Compute current task's Fisher
-        F_new = self.fisher_estimator.estimate(model, train_loader, criterion, config.device)
+        fisher_batch_size = getattr(config, 'fisher_batch_size', None)
+        F_new = self.fisher_estimator.estimate(model, train_loader, criterion, config.device, batch_size=fisher_batch_size)
         if self.F_old is None:
             self.F_old = F_new.clone()
         
@@ -1306,7 +1310,8 @@ class FOPNGPreFisherMethod(ContinualMethod):
         else:
             # Use estimated Fisher: compute F_current and pre-multiply
             criterion = nn.CrossEntropyLoss()
-            F_current = self.fisher_estimator.estimate(model, train_loader, criterion, config.device)
+            fisher_batch_size = getattr(config, 'fisher_batch_size', None)
+            F_current = self.fisher_estimator.estimate(model, train_loader, criterion, config.device, batch_size=fisher_batch_size)
             
             # Store Fisher for this task
             self.F_tasks[task_id] = F_current.clone()

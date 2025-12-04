@@ -1,68 +1,143 @@
-#!/bin/bash
+python3 main.py \
+        --dataset permuted_mnist \
+        --method fopng \
+        --fisher diagonal \
+        --num_tasks 5 \
+        --epochs 5 \
+        --lr 1e-4 \
+        --collector gtl \
+        --max_directions 2000 \
+        --grads_per_task 150 \
+        --fopng_lambda_reg 1e-3 \
+        --fopng_new_fisher_weight 0.5 \
+        --batch_size 10 \
+        --seed 1 \
+        --device mps
 
-datasets=(rotated_mnist split_mnist permuted_mnist)
-seeds=$(seq 1 1)
+python3 main.py \
+        --dataset permuted_mnist \
+        --method fopng \
+        --fisher diagonal \
+        --num_tasks 5 \
+        --epochs 5 \
+        --lr 5e-4 \
+        --collector gtl \
+        --max_directions 2000 \
+        --grads_per_task 150 \
+        --fopng_lambda_reg 1e-3 \
+        --fopng_new_fisher_weight 0.5 \
+        --batch_size 10 \
+        --seed 1 \
+        --device mps
 
-# Learning rate sweeps (6 values each)
-lrs_ogd=(1e-5 5e-5 1e-4 5e-4 1e-3 5e-3 1e-2 5e-2)
-lrs_fopng=(5e-6 1e-5 5e-5 1e-4 5e-4 1e-3 5e-3 1e-2)
-lrs_sgd=(5e-5 1e-4 5e-4 1e-3 5e-3 1e-2 5e-3 1e-2)
+python3 main.py \
+        --dataset permuted_mnist \
+        --method fopng \
+        --fisher diagonal \
+        --num_tasks 5 \
+        --epochs 5 \
+        --lr 1e-3 \
+        --collector gtl \
+        --max_directions 2000 \
+        --grads_per_task 150 \
+        --fopng_lambda_reg 1e-3 \
+        --fopng_new_fisher_weight 0.5 \
+        --batch_size 10 \
+        --seed 1 \
+        --device mps
 
-for dataset in "${datasets[@]}"; do
-  for seed in $seeds; do
+python3 main.py \
+        --dataset permuted_mnist \
+        --method fopng \
+        --fisher diagonal \
+        --num_tasks 5 \
+        --epochs 5 \
+        --lr 1e-4 \
+        --collector gtl \
+        --max_directions 2000 \
+        --grads_per_task 150 \
+        --fopng_lambda_reg 1e-3 \
+        --fopng_new_fisher_weight 0.5 \
+        --batch_size 10 \
+        --seed 1 \
+        --device mps
 
-    echo "==== DATASET $dataset | SEED $seed ===="
+python3 main.py \
+        --dataset permuted_mnist \
+        --method fopng \
+        --fisher diagonal \
+        --num_tasks 5 \
+        --epochs 5 \
+        --lr 5e-4 \
+        --collector gtl \
+        --max_directions 2000 \
+        --grads_per_task 150 \
+        --fopng_lambda_reg 1e-3 \
+        --fopng_new_fisher_weight 0.5 \
+        --batch_size 10 \
+        --seed 1 \
+        --device mps
 
-    # ---------------------- OGD ----------------------
-    for lr in "${lrs_ogd[@]}"; do
-      echo "Running OGD (lr=$lr, seed=$seed) on $dataset"
-      python3 main.py \
-          --dataset "$dataset" \
-          --method ogd \
-          --num_tasks 5 \
-          --epochs 5 \
-          --lr "$lr" \
-          --collector gtl \
-          --max_directions 2000 \
-          --grads_per_task 80 \
-          --batch_size 10 \
-          --seed "$seed" \
-          --device mps
-    done
+python3 main.py \
+        --dataset rotated_mnist \
+        --method fopng \
+        --fisher diagonal \
+        --num_tasks 5 \
+        --epochs 5 \
+        --lr 1e-3 \
+        --collector gtl \
+        --max_directions 2000 \
+        --grads_per_task 150 \
+        --fopng_lambda_reg 1e-2 \
+        --fopng_new_fisher_weight 0.5 \
+        --batch_size 10 \
+        --seed 1 \
+        --device mps
 
-    # ---------------------- FOPNG ----------------------
-    for lr in "${lrs_fopng[@]}"; do
-      echo "Running FOPNG (lr=$lr, seed=$seed) on $dataset"
-      python3 main.py \
-          --dataset "$dataset" \
-          --method fopng \
-          --fisher diagonal \
-          --num_tasks 5 \
-          --epochs 5 \
-          --lr "$lr" \
-          --collector gtl \
-          --max_directions 2000 \
-          --grads_per_task 80 \
-          --fopng_lambda_reg 1e-3 \
-          --fopng_new_fisher_weight 0.5 \
-          --batch_size 10 \
-          --seed "$seed" \
-          --device mps
-    done
+python3 main.py \
+        --dataset rotated_mnist \
+        --method fopng \
+        --fisher diagonal \
+        --num_tasks 5 \
+        --epochs 5 \
+        --lr 5e-3 \
+        --collector gtl \
+        --max_directions 2000 \
+        --grads_per_task 150 \
+        --fopng_lambda_reg 1e-2 \
+        --fopng_new_fisher_weight 0.5 \
+        --batch_size 10 \
+        --seed 1 \
+        --device mps
 
-    # ---------------------- SGD ----------------------
-    for lr in "${lrs_sgd[@]}"; do
-      echo "Running SGD (lr=$lr, seed=$seed) on $dataset"
-      python3 main.py \
-          --dataset "$dataset" \
-          --method sgd \
-          --grads_per_task 80 \
-          --num_tasks 5 \
-          --epochs 5 \
-          --lr "$lr" \
-          --batch_size 10 \
-          --seed "$seed" \
-          --device mps
-    done
-  done
-done
+python3 main.py \
+        --dataset rotated_mnist \
+        --method fopng \
+        --fisher diagonal \
+        --num_tasks 5 \
+        --epochs 5 \
+        --lr 1e-3 \
+        --collector gtl \
+        --max_directions 2000 \
+        --grads_per_task 150 \
+        --fopng_lambda_reg 1e-4 \
+        --fopng_new_fisher_weight 0.5 \
+        --batch_size 10 \
+        --seed 1 \
+        --device mps
+
+python3 main.py \
+        --dataset rotated_mnist \
+        --method fopng \
+        --fisher diagonal \
+        --num_tasks 5 \
+        --epochs 5 \
+        --lr 5e-3 \
+        --collector gtl \
+        --max_directions 2000 \
+        --grads_per_task 150 \
+        --fopng_lambda_reg 1e-4 \
+        --fopng_new_fisher_weight 0.5 \
+        --batch_size 10 \
+        --seed 1 \
+        --device mps

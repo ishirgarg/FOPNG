@@ -18,9 +18,10 @@ class FisherEstimator(ABC):
         model: nn.Module,
         dataloader: DataLoader,
         criterion: nn.Module,
-        device: str
+        device: str,
+        batch_size: Optional[int] = None
     ) -> torch.Tensor:
-        """Estimate Fisher information."""
+        """Estimate Fisher information. If batch_size is specified, use that instead."""
         pass
 
 
@@ -41,7 +42,8 @@ class DiagonalFisherEstimator(FisherEstimator):
         model: nn.Module,
         dataloader: DataLoader,
         criterion: nn.Module,
-        device: str
+        device: str,
+        batch_size: Optional[int] = None
     ) -> torch.Tensor:
         model.eval()
         
@@ -49,10 +51,17 @@ class DiagonalFisherEstimator(FisherEstimator):
         if device.startswith('cuda'):
             torch.cuda.empty_cache()
         
-        if self.use_vmap:
-            return self._estimate_vmap(model, dataloader, criterion, device)
+        # If batch_size is specified, create a new loader with that batch size
+        if batch_size is not None:
+            dataset = dataloader.dataset
+            fisher_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
         else:
-            return self._estimate_sequential(model, dataloader, criterion, device)
+            fisher_loader = dataloader
+        
+        if self.use_vmap:
+            return self._estimate_vmap(model, fisher_loader, criterion, device)
+        else:
+            return self._estimate_sequential(model, fisher_loader, criterion, device)
     
     def _estimate_sequential(
         self,
@@ -154,7 +163,8 @@ class FullFisherEstimator(FisherEstimator):
         model: nn.Module,
         dataloader: DataLoader,
         criterion: nn.Module,
-        device: str
+        device: str,
+        batch_size: Optional[int] = None
     ) -> torch.Tensor:
         model.eval()
         
@@ -162,11 +172,19 @@ class FullFisherEstimator(FisherEstimator):
         if device.startswith('cuda'):
             torch.cuda.empty_cache()
         
+        # If batch_size is specified, create a new loader with that batch size
+        if batch_size is not None:
+            from torch.utils.data import DataLoader as DL
+            dataset = dataloader.dataset
+            fisher_loader = DL(dataset, batch_size=batch_size, shuffle=False)
+        else:
+            fisher_loader = dataloader
+        
         p = get_param_count(model)
         fisher = torch.zeros(p, p, device=device)
         n_samples = 0
         
-        for data, target in dataloader:
+        for data, target in fisher_loader:
             data, target = data.to(device), target.to(device)
             for i in range(data.size(0)):
                 model.zero_grad()
