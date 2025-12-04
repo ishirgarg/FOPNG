@@ -1,0 +1,28 @@
+python3 main.py \
+    --dataset "rotated_mnist" \
+    --method ewc \
+    --fisher diagonal \
+    --num_tasks 5 \
+    --epochs 5 \
+    --lr 1e-2 \
+    --ewc_lambda 50 \
+    --batch_size 10 \
+    --fisher_batch_size 1024 \
+    --seed 1 \
+    --device auto \
+
+python3 main.py \
+    --dataset "rotated_mnist" \
+    --method fopng \
+    --fisher diagonal \
+    --num_tasks 5 \
+    --epochs 5 \
+    --lr 1e-3 \
+    --batch_size 10 \
+    --collector gtl \
+    --grads_per_task 80 \
+    --fisher_batch_size 1024 \
+    --fopng_lambda_reg 1e-3 \
+    --fopng_new_fisher_weight 0.5 \
+    --seed 1 \
+    --device auto \
