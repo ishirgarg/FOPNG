@@ -109,6 +109,10 @@ def init_wandb(
     wandb.define_metric("average_accuracy_test", step_metric="trained_task")
     wandb.define_metric("average_accuracy_train", step_metric="trained_task")
     
+    # Per-batch metrics use global_batch_idx as x-axis (monotonic across epochs/tasks)
+    wandb.define_metric("global_batch_idx")
+    wandb.define_metric("fopng_batch/*", step_metric="global_batch_idx")
+    
     print(f"Wandb initialized: {_wandb_run.url}")
 
 

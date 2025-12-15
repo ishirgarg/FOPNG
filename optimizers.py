@@ -321,6 +321,7 @@ class FOPNGMethod(ContinualMethod):
         self.memory.clear()
         self.F_old = None
         self.lambda_reg = config.fopng_lambda_reg
+        self.global_batch_idx = 0  # Monotonically increasing batch counter
 
     def _compute_update_prep(
         self,
@@ -643,6 +644,14 @@ class FOPNGMethod(ContinualMethod):
             grad = get_grad_vector(model)
             update, stats = self._compute_update(grad, F_new, self.F_old, G, config.device, config.lr, return_intermediate=True)
             apply_update(model, update)
+            
+            # Log per-batch loss with monotonically increasing index
+            log({
+                "global_batch_idx": self.global_batch_idx,
+                "fopng_batch/loss": loss.item(),
+                "task_id": task_id,
+            })
+            self.global_batch_idx += 1
             
             # Accumulate all statistics
             for key in batch_stats.keys():
