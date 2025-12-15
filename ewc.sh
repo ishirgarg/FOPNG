@@ -1,28 +1,34 @@
-python3 main.py \
-    --dataset "rotated_mnist" \
-    --method ewc \
-    --fisher diagonal \
-    --num_tasks 5 \
-    --epochs 5 \
-    --lr 1e-2 \
-    --ewc_lambda 50 \
-    --batch_size 10 \
-    --fisher_batch_size 1024 \
-    --seed 1 \
-    --device auto \
+datasets=(split_mnist_ic)
+seeds=$(seq 1 1)
 
-python3 main.py \
-    --dataset "rotated_mnist" \
-    --method fopng \
-    --fisher diagonal \
-    --num_tasks 5 \
-    --epochs 5 \
-    --lr 1e-3 \
-    --batch_size 10 \
-    --collector gtl \
-    --grads_per_task 80 \
-    --fisher_batch_size 1024 \
-    --fopng_lambda_reg 1e-3 \
-    --fopng_new_fisher_weight 0.5 \
-    --seed 1 \
-    --device auto \
+# EWC hyperparameter sweeps (original paper range)
+# Lambda values - paper uses 1-1000 range typically
+ewc_lambdas=(10 50 100 400)
+# Learning rates
+lrs_ewc=(5e-4 1e-3 5e-3 1e-2)
+
+for dataset in "${datasets[@]}"; do
+  for seed in $seeds; do
+    echo "==== DATASET $dataset | SEED $seed ===="
+
+    # ---------------------- EWC ----------------------
+    for ewc_lambda in "${ewc_lambdas[@]}"; do
+      for lr in "${lrs_ewc[@]}"; do
+        echo "Running EWC (lambda=$ewc_lambda, lr=$lr, seed=$seed) on $dataset"
+        python3 main.py \
+            --dataset "$dataset" \
+            --method ewc \
+            --fisher diagonal \
+            --num_tasks 5 \
+            --epochs 5 \
+            --lr "$lr" \
+            --ewc_lambda "$ewc_lambda" \
+            --batch_size 10 \
+            --seed "$seed" \
+            --device auto \
+            --wandb_project "fopng" \
+            --wandb_tags ewc sweep "$dataset"
+      done
+    done
+  done
+done
