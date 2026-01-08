@@ -31,6 +31,8 @@ class Config:
     use_empirical_fisher: bool = False  # For FOPNG-PF: compute F*g on-the-fly during gradient collection instead of pre-multiplying by estimated Fisher
     fisher_batch_size: Optional[int] = None  # If set, estimate Fisher from this batch size instead of using the full training set
     ewc_lambda: float = 100.0
+    first_task_lr: Optional[float] = None  # If set, use this learning rate for the first task (task_id=0) instead of lr
+    use_adam: bool = False  # If True, use Adam optimizer for first task instead of SGD (or whatever optimizer is passed)
     
     def __post_init__(self):
         if self.device == "auto":

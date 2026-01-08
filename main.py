@@ -618,6 +618,10 @@ def main():
                         help="For FOPNG-PF: compute F*g on-the-fly during gradient collection instead of pre-multiplying by estimated Fisher")
     parser.add_argument("--fisher_batch_size", type=int, default=None,
                         help="If set, estimate Fisher from this batch size instead of the full training set")
+    parser.add_argument("--first_task_lr", type=float, default=None,
+                        help="If set, use this learning rate for the first task (task_id=0) instead of lr")
+    parser.add_argument("--use_adam", action="store_true", default=False,
+                        help="If set, use Adam optimizer for first task instead of SGD")
 
     # --------------------------------
     # Logging / saving
@@ -676,6 +680,12 @@ def main():
 
         # EWC
         ewc_lambda=args.ewc_lambda,
+
+        # First task learning rate
+        first_task_lr=args.first_task_lr,
+        
+        # Use Adam for first task
+        use_adam=args.use_adam,
     )
 
     # --------------------------------------------------------------------

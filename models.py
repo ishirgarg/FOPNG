@@ -5,34 +5,29 @@ from typing import List, Optional
 
 
 def _cifar_feature_extractor():
+    """
+    Simplified CNN backbone: 4 convolutional layers.
+    Architecture: Conv -> ReLU -> Conv -> ReLU -> MaxPool -> Conv -> ReLU -> Conv -> ReLU -> MaxPool
+    """
     return nn.Sequential(
-        nn.Conv2d(3, 64, kernel_size=3, padding=1),
-        nn.BatchNorm2d(64),
+        # Conv block 1: 3 -> 32
+        nn.Conv2d(3, 32, kernel_size=3, padding=1),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(32, 32, kernel_size=3, padding=1),
+        nn.ReLU(inplace=True),
+        nn.MaxPool2d(2),
+        
+        # Conv block 2: 32 -> 64
+        nn.Conv2d(32, 64, kernel_size=3, padding=1),
         nn.ReLU(inplace=True),
         nn.Conv2d(64, 64, kernel_size=3, padding=1),
-        nn.BatchNorm2d(64),
-        nn.ReLU(inplace=True),
-        nn.MaxPool2d(2),
-        
-        nn.Conv2d(64, 128, kernel_size=3, padding=1),
-        nn.BatchNorm2d(128),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(128, 128, kernel_size=3, padding=1),
-        nn.BatchNorm2d(128),
-        nn.ReLU(inplace=True),
-        nn.MaxPool2d(2),
-        
-        nn.Conv2d(128, 256, kernel_size=3, padding=1),
-        nn.BatchNorm2d(256),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(256, 256, kernel_size=3, padding=1),
-        nn.BatchNorm2d(256),
         nn.ReLU(inplace=True),
         nn.MaxPool2d(2),
     )
 
 
-CIFAR_FEATURE_DIM = 256 * 4 * 4
+# After 2 maxpools on 32x32: 32 -> 16 -> 8, with 64 channels
+CIFAR_FEATURE_DIM = 64 * 8 * 8
 
 class MLP(nn.Module):
     """
@@ -88,25 +83,26 @@ class MultiHeadMLP(nn.Module):
 
 class SimpleCIFARCNN(nn.Module):
     """
-    Lightweight CNN baseline for CIFAR experiments.
+    Simplified CNN for CIFAR experiments.
     
     Architecture:
-        [Conv(3→64) + BN + ReLU] × 2 -> MaxPool
-        [Conv(64→128) + BN + ReLU] × 2 -> MaxPool
-        [Conv(128→256) + BN + ReLU] × 2 -> MaxPool
-        FC 256*4*4 -> 512 -> num_classes
+        4 conv layers (2 blocks with maxpool)
+        2 dense layers with dropout
     """
     
-    def __init__(self, num_classes: int = 10, dropout: float = 0.3):
+    def __init__(self, num_classes: int = 10, dropout: float = 0.5):
         super().__init__()
         self.features = _cifar_feature_extractor()
         
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(CIFAR_FEATURE_DIM, 512),
+            nn.Linear(CIFAR_FEATURE_DIM, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(512, num_classes)
+            nn.Linear(256, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(256, num_classes)
         )
     
     def forward(self, x):
@@ -116,20 +112,24 @@ class SimpleCIFARCNN(nn.Module):
 
 class MultiHeadCIFARCNN(nn.Module):
     """
-    CNN trunk shared across tasks with individual heads.
+    Simplified CNN trunk shared across tasks with individual heads.
+    4 conv layers + 2 dense layers with dropout.
     """
     
     def __init__(
         self,
         num_heads: int,
         head_output_sizes: Optional[List[int]] = None,
-        dropout: float = 0.3
+        dropout: float = 0.5
     ):
         super().__init__()
         self.features = _cifar_feature_extractor()
         self.shared_classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(CIFAR_FEATURE_DIM, 512),
+            nn.Linear(CIFAR_FEATURE_DIM, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(256, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout)
         )
@@ -138,7 +138,7 @@ class MultiHeadCIFARCNN(nn.Module):
             head_output_sizes = [2] * num_heads
         
         self.heads = nn.ModuleList([
-            nn.Linear(512, out_dim) for out_dim in head_output_sizes
+            nn.Linear(256, out_dim) for out_dim in head_output_sizes
         ])
     
     def forward(self, x, task_id: int = 0):

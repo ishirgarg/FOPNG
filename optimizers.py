@@ -206,6 +206,13 @@ class OGDMethod(ContinualMethod):
         total_correct = 0
         total_samples = 0
         
+        # For first task, optionally use different optimizer based on config
+        if task_id == 0:
+            first_task_lr = getattr(config, 'first_task_lr', None)
+            use_adam = getattr(config, 'use_adam', False)
+            if use_adam:
+                optimizer = torch.optim.Adam(model.parameters(), lr=first_task_lr)
+        
         # Accumulators for gradient norms and ratios (log average per epoch)
         raw_grad_norms = []
         proj_grad_norms = []
@@ -719,6 +726,15 @@ class FOPNGMethod(ContinualMethod):
         total_correct = 0
         total_samples = 0
         
+        # Determine optimizer type and learning rate for first task
+        first_task_lr = getattr(config, 'first_task_lr', None)
+        use_adam = getattr(config, 'use_adam', False)
+        
+        if use_adam:
+            first_task_optimizer = torch.optim.Adam(model.parameters(), lr=first_task_lr)
+        else:
+            first_task_optimizer = type(optimizer)(model.parameters(), lr=first_task_lr)
+        
         # Accumulators for gradient norms (log average per epoch)
         raw_grad_norms = []
         
@@ -728,7 +744,7 @@ class FOPNGMethod(ContinualMethod):
             x = x.to(config.device)
             y = y.to(config.device)
             
-            optimizer.zero_grad()
+            first_task_optimizer.zero_grad()
             
             if multihead:
                 logits = model(x, task_id=task_id)
@@ -742,7 +758,7 @@ class FOPNGMethod(ContinualMethod):
             grad = get_grad_vector(model)
             raw_grad_norms.append(grad.norm().item())
             
-            optimizer.step()
+            first_task_optimizer.step()
             
             total_loss += loss.item() * x.size(0)
             preds = logits.argmax(dim=1)
@@ -969,6 +985,15 @@ class FNGMethod(ContinualMethod):
         total_correct = 0
         total_samples = 0
         
+        # Determine optimizer type and learning rate for first task
+        first_task_lr = getattr(config, 'first_task_lr', None)
+        use_adam = getattr(config, 'use_adam', False)
+        
+        if use_adam:
+            first_task_optimizer = torch.optim.Adam(model.parameters(), lr=first_task_lr)
+        else:
+            first_task_optimizer = type(optimizer)(model.parameters(), lr=first_task_lr)
+        
         # Accumulators for gradient norms (log average per epoch)
         raw_grad_norms = []
         
@@ -978,7 +1003,7 @@ class FNGMethod(ContinualMethod):
             x = x.to(config.device)
             y = y.to(config.device)
             
-            optimizer.zero_grad()
+            first_task_optimizer.zero_grad()
             
             if multihead:
                 logits = model(x, task_id=task_id)
@@ -992,7 +1017,7 @@ class FNGMethod(ContinualMethod):
             grad = get_grad_vector(model)
             raw_grad_norms.append(grad.norm().item())
             
-            optimizer.step()
+            first_task_optimizer.step()
             
             total_loss += loss.item() * x.size(0)
             preds = logits.argmax(dim=1)
@@ -1252,6 +1277,16 @@ class FOPNGPreFisherMethod(ContinualMethod):
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
+        
+        # Determine optimizer type and learning rate for first task
+        first_task_lr = getattr(config, 'first_task_lr', None)
+        use_adam = getattr(config, 'use_adam', False)
+        
+        if use_adam:
+            first_task_optimizer = torch.optim.Adam(model.parameters(), lr=first_task_lr)
+        else:
+            first_task_optimizer = type(optimizer)(model.parameters(), lr=first_task_lr)
+        
         raw_grad_norms = []
         
         iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
@@ -1260,7 +1295,7 @@ class FOPNGPreFisherMethod(ContinualMethod):
             x = x.to(config.device)
             y = y.to(config.device)
             
-            optimizer.zero_grad()
+            first_task_optimizer.zero_grad()
             if multihead:
                 logits = model(x, task_id=task_id)
             else:
@@ -1270,7 +1305,7 @@ class FOPNGPreFisherMethod(ContinualMethod):
             loss.backward()
             grad = get_grad_vector(model)
             raw_grad_norms.append(grad.norm().item())
-            optimizer.step()
+            first_task_optimizer.step()
             
             total_loss += loss.item() * x.size(0)
             preds = logits.argmax(dim=1)
@@ -1284,7 +1319,7 @@ class FOPNGPreFisherMethod(ContinualMethod):
         })
         
         return total_loss / total_samples, total_correct / total_samples
-    
+
     def after_task(
         self,
         model: nn.Module,
@@ -1399,6 +1434,14 @@ class EWCMethod(ContinualMethod):
         total_ewc_loss = 0.0
         total_correct = 0
         total_samples = 0
+        
+        # For first task, optionally use different optimizer based on config
+        if task_id == 0:
+            first_task_lr = getattr(config, 'first_task_lr', None)
+            use_adam = getattr(config, 'use_adam', False)
+            
+            if use_adam:
+                optimizer = torch.optim.Adam(model.parameters(), lr=first_task_lr)
 
         iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
 
