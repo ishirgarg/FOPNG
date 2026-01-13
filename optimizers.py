@@ -82,6 +82,23 @@ class SGDMethod(ContinualMethod):
         total_correct = 0
         total_samples = 0
         
+        # For first task, optionally use different optimizer based on config
+        if task_id == 0:
+            first_task_lr = getattr(config, 'first_task_lr', None)
+            use_adam = getattr(config, 'use_adam', False)
+            use_sgd = getattr(config, 'use_sgd', False)
+            
+            if first_task_lr is None:
+                first_task_lr = config.lr
+            
+            if use_adam:
+                optimizer = torch.optim.Adam(model.parameters(), lr=first_task_lr)
+            elif use_sgd:
+                optimizer = torch.optim.SGD(model.parameters(), lr=first_task_lr)
+            elif first_task_lr != config.lr:
+                # Only create new optimizer if learning rate is different
+                optimizer = type(optimizer)(model.parameters(), lr=first_task_lr)
+        
         iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
         
         for x, y in iterator:
@@ -137,6 +154,23 @@ class AdamMethod(ContinualMethod):
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
+        
+        # For first task, optionally use different optimizer based on config
+        if task_id == 0:
+            first_task_lr = getattr(config, 'first_task_lr', None)
+            use_adam = getattr(config, 'use_adam', False)
+            use_sgd = getattr(config, 'use_sgd', False)
+            
+            if first_task_lr is None:
+                first_task_lr = config.lr
+            
+            if use_adam:
+                optimizer = torch.optim.Adam(model.parameters(), lr=first_task_lr)
+            elif use_sgd:
+                optimizer = torch.optim.SGD(model.parameters(), lr=first_task_lr)
+            elif first_task_lr != config.lr:
+                # Only create new optimizer if learning rate is different
+                optimizer = type(optimizer)(model.parameters(), lr=first_task_lr)
         
         iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
         
@@ -210,8 +244,18 @@ class OGDMethod(ContinualMethod):
         if task_id == 0:
             first_task_lr = getattr(config, 'first_task_lr', None)
             use_adam = getattr(config, 'use_adam', False)
+            use_sgd = getattr(config, 'use_sgd', False)
+            
+            if first_task_lr is None:
+                first_task_lr = config.lr
+            
             if use_adam:
                 optimizer = torch.optim.Adam(model.parameters(), lr=first_task_lr)
+            elif use_sgd:
+                optimizer = torch.optim.SGD(model.parameters(), lr=first_task_lr)
+            elif first_task_lr != config.lr:
+                # Only create new optimizer if learning rate is different
+                optimizer = type(optimizer)(model.parameters(), lr=first_task_lr)
         
         # Accumulators for gradient norms and ratios (log average per epoch)
         raw_grad_norms = []
@@ -729,9 +773,12 @@ class FOPNGMethod(ContinualMethod):
         # Determine optimizer type and learning rate for first task
         first_task_lr = getattr(config, 'first_task_lr', None)
         use_adam = getattr(config, 'use_adam', False)
+        use_sgd = getattr(config, 'use_sgd', False)
         
         if use_adam:
             first_task_optimizer = torch.optim.Adam(model.parameters(), lr=first_task_lr)
+        elif use_sgd:
+            first_task_optimizer = torch.optim.SGD(model.parameters(), lr=first_task_lr)
         else:
             first_task_optimizer = type(optimizer)(model.parameters(), lr=first_task_lr)
         
@@ -988,9 +1035,12 @@ class FNGMethod(ContinualMethod):
         # Determine optimizer type and learning rate for first task
         first_task_lr = getattr(config, 'first_task_lr', None)
         use_adam = getattr(config, 'use_adam', False)
+        use_sgd = getattr(config, 'use_sgd', False)
         
         if use_adam:
             first_task_optimizer = torch.optim.Adam(model.parameters(), lr=first_task_lr)
+        elif use_sgd:
+            first_task_optimizer = torch.optim.SGD(model.parameters(), lr=first_task_lr)
         else:
             first_task_optimizer = type(optimizer)(model.parameters(), lr=first_task_lr)
         
@@ -1281,9 +1331,12 @@ class FOPNGPreFisherMethod(ContinualMethod):
         # Determine optimizer type and learning rate for first task
         first_task_lr = getattr(config, 'first_task_lr', None)
         use_adam = getattr(config, 'use_adam', False)
+        use_sgd = getattr(config, 'use_sgd', False)
         
         if use_adam:
             first_task_optimizer = torch.optim.Adam(model.parameters(), lr=first_task_lr)
+        elif use_sgd:
+            first_task_optimizer = torch.optim.SGD(model.parameters(), lr=first_task_lr)
         else:
             first_task_optimizer = type(optimizer)(model.parameters(), lr=first_task_lr)
         
@@ -1439,9 +1492,18 @@ class EWCMethod(ContinualMethod):
         if task_id == 0:
             first_task_lr = getattr(config, 'first_task_lr', None)
             use_adam = getattr(config, 'use_adam', False)
+            use_sgd = getattr(config, 'use_sgd', False)
+            
+            if first_task_lr is None:
+                first_task_lr = config.lr
             
             if use_adam:
                 optimizer = torch.optim.Adam(model.parameters(), lr=first_task_lr)
+            elif use_sgd:
+                optimizer = torch.optim.SGD(model.parameters(), lr=first_task_lr)
+            elif first_task_lr != config.lr:
+                # Only create new optimizer if learning rate is different
+                optimizer = type(optimizer)(model.parameters(), lr=first_task_lr)
 
         iterator = tqdm(train_loader, desc=progress_desc, leave=False) if progress_desc else train_loader
 

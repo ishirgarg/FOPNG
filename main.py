@@ -622,6 +622,8 @@ def main():
                         help="If set, use this learning rate for the first task (task_id=0) instead of lr")
     parser.add_argument("--use_adam", action="store_true", default=False,
                         help="If set, use Adam optimizer for first task instead of SGD")
+    parser.add_argument("--use_sgd", action="store_true", default=False,
+                        help="If set, use SGD optimizer for first task instead of Adam")
 
     # --------------------------------
     # Logging / saving
@@ -686,6 +688,9 @@ def main():
         
         # Use Adam for first task
         use_adam=args.use_adam,
+        
+        # Use SGD for first task
+        use_sgd=args.use_sgd,
     )
 
     # --------------------------------------------------------------------
