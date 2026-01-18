@@ -23,7 +23,6 @@ from optimizers import ContinualMethod, FOPNGPreFisherMethod, SGDMethod, AdamMet
 from gradients import GTLCollector, GradientCollector
 from fisher import DiagonalFisherEstimator, FullFisherEstimator, FisherEstimator, fisher_norm_distance
 from utils import set_seed, evaluate
-from visualization import plot_results
 from logger import ExperimentLogger
 
 def run_experiment(
