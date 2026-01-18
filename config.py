@@ -34,6 +34,8 @@ class Config:
     first_task_lr: Optional[float] = None  # If set, use this learning rate for the first task (task_id=0) instead of lr
     use_adam: bool = False  # If True, use Adam optimizer for first task instead of SGD (or whatever optimizer is passed)
     use_sgd: bool = False  # If True, use SGD optimizer for first task instead of Adam (or whatever optimizer is passed)
+
+    dummy_flag: bool = True# Ignore, can be removed
     
     def __post_init__(self):
         if self.device == "auto":

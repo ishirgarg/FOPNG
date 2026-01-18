@@ -690,6 +690,7 @@ def main():
         
         # Use SGD for first task
         use_sgd=args.use_sgd,
+        dummy_flag=True,
     )
 
     # --------------------------------------------------------------------

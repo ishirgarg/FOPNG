@@ -435,7 +435,7 @@ class FOPNGMethod(ContinualMethod):
             F_new_inv_diag = 1.0 / (F_new + lam)
             
             # Original projection logic
-            F_old_g = F_old * gradient
+            F_old_g = F_old * F_new_inv_diag * gradient
             G_T_F_old_g = G.T @ F_old_g
             A_inv_G_T_F_old_g = self.A_inv @ G_T_F_old_g
             correction = (G @ A_inv_G_T_F_old_g).view(-1) * F_old.squeeze()
@@ -1157,7 +1157,7 @@ class FOPNGPreFisherMethod(ContinualMethod):
         if self.is_diagonal:
             F_new_inv_diag = 1.0 / (F_new + lam)
             
-            G_T_g = G_prefisher.T @ gradient
+            G_T_g = G_prefisher.T @ (F_new_inv_diag * gradient)
             
             A_inv_G_T_g = self.A_inv @ G_T_g
             correction = (G_prefisher @ A_inv_G_T_g).view(-1)
