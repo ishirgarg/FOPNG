@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=fopng_sweep
+#SBATCH --job-name=big_sweep
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
 #SBATCH --qos=rail_gpu4_high
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --time=48:00:00
+#SBATCH --time=72:00:00
 #SBATCH --array=0-15
 
 ############################################
@@ -22,16 +22,6 @@ WORKER_ID=${SLURM_ARRAY_TASK_ID}
 # Build command list
 ############################################
 COMMANDS=()
-
-#!/bin/bash
-#SBATCH --job-name=fopng_sweep
-#SBATCH --account=co_rail
-#SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu_normal
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --time=48:00:00
-#SBATCH --array=0-15
 
 ############################################
 # Parameters
