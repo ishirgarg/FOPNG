@@ -2,6 +2,7 @@
 data/
 datagen/
 wandb/
+experiments/
 
 # Mac files
 .DS_Store
