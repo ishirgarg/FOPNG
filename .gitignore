@@ -1,5 +1,7 @@
 # Repo files
 data/
+datagen/
+wandb/
 
 # Mac files
 .DS_Store
