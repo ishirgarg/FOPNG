@@ -389,7 +389,8 @@ class FOPNGMethod(ContinualMethod):
             F_new_inv_diag = 1.0 / (F_new + lam)
             F_old_diag = F_old.view(-1, 1)
             F_old_G = F_old_diag * G
-            weighted_G = F_old_diag * (F_new_inv_diag.view(-1, 1) * F_old_G)
+            # weighted_G = F_old_diag * (F_new_inv_diag.view(-1, 1) * F_old_G)
+            weighted_G = F_old_diag * (F_old_G)
             A = G.T @ weighted_G + lam * torch.eye(G.size(1), device=device)
 
             self.A_inv = torch.pinverse(A)

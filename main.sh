@@ -1,0 +1,1 @@
+python3 main.py --dataset split_mnist_ic --method fopng --fisher diagonal --num_tasks 5 --epochs 5 --lr 1e-4 --collector gtl --max_directions 2000 --grads_per_task 80 --fopng_lambda_reg 5e-4 --fopng_new_fisher_weight 0.5 --batch_size 10 --seed 1 --use_sgd --first_task_lr 1e-2 --device mps
