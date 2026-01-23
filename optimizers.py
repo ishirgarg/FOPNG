@@ -1129,7 +1129,9 @@ class FOPNGPreFisherMethod(ContinualMethod):
             # Since G is already F*g, we just use it directly
             # A = G.T @ G (no F_old multiplication needed - already baked in G)
             F_new_inv_diag = 1.0 / (F_new + lam)
-            A = G_prefisher.T @ (F_new_inv_diag.view(-1, 1) * G_prefisher) + lam * torch.eye(G_prefisher.size(1), device=device)
+            # A = G_prefisher.T @ (F_new_inv_diag.view(-1, 1) * G_prefisher) + lam * torch.eye(G_prefisher.size(1), device=device)
+            A = G_prefisher.T @ (G_prefisher) + lam * torch.eye(G_prefisher.size(1), device=device)
+
             self.A_inv = torch.pinverse(A)
             self.A = A
         else:
